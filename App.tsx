@@ -9,6 +9,9 @@ import {
   Animated,
   Easing,
   Alert,
+  Dimensions,
+  NativeModules,
+  NativeEventEmitter,
 } from 'react-native';
 import {
   Camera,
@@ -17,6 +20,8 @@ import {
 } from 'react-native-vision-camera';
 import type { Camera as CameraType } from 'react-native-vision-camera';
 import RNFS from 'react-native-fs';
+import 'react-native-get-random-values';
+import uuid from 'react-native-uuid';
 
 
 // Backend API configuration
@@ -25,7 +30,7 @@ import RNFS from 'react-native-fs';
 // const BACKEND_URL = 'http://10.0.2.2:3001'; // Change this to your backend URL
 
 // Ngrok URL
-const BACKEND_URL = 'https://962b60825ad3.ngrok-free.app'; // Change this to your backend URL
+const BACKEND_URL = 'https://aaa69efce64b.ngrok-free.app'; // Change this to your backend URL
 
 // API functions
 const apiCall = async (endpoint: string, method: string = 'GET', body?: any) => {
@@ -69,6 +74,78 @@ const apiCall = async (endpoint: string, method: string = 'GET', body?: any) => 
 // };
 
 
+
+// Types for metadata
+interface RecordingMetadata {
+  deviceId: string;
+  timestamp: string;
+  location?: {
+    latitude: number;
+    longitude: number;
+    accuracy: number;
+  };
+  deviceInfo: {
+    brand: string;
+    model: string;
+    os: string;
+    osVersion: string;
+  };
+  cameraInfo: {
+    id: string;
+    position: string; // Can be 'front', 'back', or 'external'
+    resolution: {
+      width: number;
+      height: number;
+    };
+  };
+  viewport: {
+    width: number;
+    height: number;
+    scale: number;
+    fontScale: number;
+  };
+  orientation: 'portrait' | 'landscape';
+  gyro?: {
+    x: number;
+    y: number;
+    z: number;
+  };
+  recordingSettings: {
+    codec: string;
+    quality: string;
+    bitrate: number;
+  };
+}
+
+export default function App() {
+  const camera = useRef<CameraType>(null);
+  // Track the current chunk index
+const currentChunkIndex = useRef(0);
+  const [hasPermission, setHasPermission] = useState(false);
+  const [showCamera, setShowCamera] = useState(false);
+  const [showSplash, setShowSplash] = useState(true);
+  const [isRecording, setIsRecording] = useState(false);
+  const [sessionId, setSessionId] = useState<string | null>(null);
+  const [uploadStatus, setUploadStatus] = useState<string>('Ready');
+  const [deviceOrientation, setDeviceOrientation] = useState<'portrait' | 'landscape'>(
+    Dimensions.get('window').width > Dimensions.get('window').height ? 'landscape' : 'portrait'
+  );
+  const [location, setLocation] = useState<{latitude: number, longitude: number, accuracy: number} | null>(null);
+  const [gyroData, setGyroData] = useState<{x: number, y: number, z: number} | null>(null);
+  
+  const recordingTimer = useRef<NodeJS.Timeout | null>(null);
+  const isSegmentProcessing = useRef(false);
+  const gyroSubscription = useRef<{remove: () => void} | null>(null);
+  const locationSubscription = useRef<{remove: () => void} | null>(null);
+
+  // Animation for the "Open Camera" button
+  const pulseAnim = useRef(new Animated.Value(1)).current;
+
+  const devices = useCameraDevices();
+  const device = devices.find(device => device.position === 'back');
+
+
+
 function getMimeType(ext: string) {
   switch (ext.toLowerCase()) {
     case 'mp4':
@@ -82,46 +159,78 @@ function getMimeType(ext: string) {
   }
 }
 
-const uploadVideoChunk = async (videoPath: string) => {
+const uploadVideoChunk = async (videoPath: string, metadata: RecordingMetadata) => {
   try {
     const ext = videoPath.split('.').pop() || 'mov';
     const mimeType = getMimeType(ext);
+    const timestamp = new Date().toISOString();
+    const chunkIndex = currentChunkIndex.current;
 
     const formData = new FormData();
+    
+    // Append video file
     formData.append('video', {
       uri: Platform.OS === 'android' ? 'file://' + videoPath : videoPath,
       type: mimeType,
       name: `video_${Date.now()}.${ext}`,
     } as any);
+    
+    // Append metadata as a JSON string
+    const metadataBlob = new Blob(
+      [JSON.stringify({
+        ...metadata,
+        chunkTimestamp: timestamp,
+        chunkIndex: chunkIndex,
+      })],
+      { 
+        type: 'application/json',
+        // @ts-ignore - BlobOptions type is not fully compatible with React Native
+        lastModified: Date.now()
+      }
+    );
+    
+    formData.append('metadata', {
+      uri: `data:application/json;base64,${await blobToBase64(metadataBlob)}`,
+      type: 'application/json',
+      name: 'metadata.json',
+    } as any);
 
+    console.log(`Uploading chunk ${chunkIndex} with metadata:`, 
+      JSON.stringify(metadata, null, 2));
+      
     const response = await fetch(`${BACKEND_URL}/upload-chunk`, {
       method: 'POST',
       body: formData,
+      headers: {
+        'Content-Type': 'multipart/form-data',
+      },
     });
 
-    return await response.json();
+    const result = await response.json();
+    console.log(`Chunk ${chunkIndex} upload response:`, result);
+    
+    // Increment chunk index for next upload
+    currentChunkIndex.current += 1;
+    
+    return result;
   } catch (error) {
     console.error('Video upload failed:', error);
     throw error;
   }
 };
 
-export default function App() {
-  const camera = useRef<CameraType>(null);
-  const [hasPermission, setHasPermission] = useState(false);
-  const [showCamera, setShowCamera] = useState(false);
-  const [showSplash, setShowSplash] = useState(true);
-  const [isRecording, setIsRecording] = useState(false);
-  const [sessionId, setSessionId] = useState<string | null>(null);
-  const [uploadStatus, setUploadStatus] = useState<string>('Ready');
-  const recordingTimer = useRef<NodeJS.Timeout | null>(null);
-  const isSegmentProcessing = useRef(false);
-
-  // Animation for the "Open Camera" button
-  const pulseAnim = useRef(new Animated.Value(1)).current;
-
-  const devices = useCameraDevices();
-  const device = devices.find(device => device.position === 'back');
+// Helper function to convert Blob to base64
+const blobToBase64 = (blob: Blob): Promise<string> => {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const base64String = (reader.result as string).split(',')[1];
+      resolve(base64String);
+    };
+    reader.onerror = reject;
+    reader.readAsDataURL(blob);
+  });
+};
 
   // Splash screen effect
   useEffect(() => {
@@ -151,10 +260,28 @@ export default function App() {
     }
   }, [showSplash, showCamera, pulseAnim]);
 
-  // Request permissions only when opening the camera
+  // Request all necessary permissions
   const requestPermissions = async () => {
+    // Camera and microphone permissions
     const cameraPermission: CameraPermissionStatus = await Camera.requestCameraPermission();
     const micPermission: CameraPermissionStatus = await Camera.requestMicrophonePermission();
+    
+    // Location permission
+    let locationPermission = false;
+    if (Platform.OS === 'android') {
+      locationPermission = await PermissionsAndroid.check(
+        PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION
+      );
+      if (!locationPermission) {
+        locationPermission = (await PermissionsAndroid.request(
+          PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION
+        )) === 'granted';
+      }
+    } else {
+      // For iOS, you'll need to handle location permissions differently
+      // This is a simplified version
+      locationPermission = true;
+    }
 
     const granted = cameraPermission === 'granted' && micPermission === 'granted';
     setHasPermission(granted);
@@ -162,15 +289,132 @@ export default function App() {
     if (Platform.OS === 'android' && granted) {
       await PermissionsAndroid.request(PermissionsAndroid.PERMISSIONS.RECORD_AUDIO);
     }
+    
     return granted;
+  };
+  
+  // Start tracking device orientation
+  const startOrientationTracking = () => {
+    Dimensions.addEventListener('change', ({ window }) => {
+      setDeviceOrientation(
+        window.width > window.height ? 'landscape' : 'portrait'
+      );
+    });
+  };
+  
+  // Start gyroscope tracking
+  const startGyroTracking = async () => {
+    try {
+      // This is a simplified version - you'll need to implement or use a library
+      // like expo-sensors for cross-platform gyroscope support
+      if (Platform.OS === 'android' && NativeModules.DeviceMotion) {
+        const DeviceMotion = new NativeEventEmitter(NativeModules.DeviceMotion);
+        gyroSubscription.current = DeviceMotion.addListener(
+          'RotationRate',
+          (data) => {
+            setGyroData({
+              x: data.x,
+              y: data.y,
+              z: data.z
+            });
+          }
+        );
+      }
+    } catch (error) {
+      console.warn('Gyroscope not available', error);
+    }
+  };
+  
+  // Start location tracking
+  const startLocationTracking = async () => {
+    try {
+      // This is a simplified version - you'll need to implement or use a library
+      // like expo-location for cross-platform location support
+      if (Platform.OS === 'android' && NativeModules.LocationManager) {
+        const LocationManager = new NativeEventEmitter(NativeModules.LocationManager);
+        locationSubscription.current = LocationManager.addListener(
+          'onLocationChanged',
+          (location) => {
+            setLocation({
+              latitude: location.latitude,
+              longitude: location.longitude,
+              accuracy: location.accuracy
+            });
+          }
+        );
+      }
+    } catch (error) {
+      console.warn('Location tracking not available', error);
+    }
+  };
+  
+  // Get device info
+  const getDeviceInfo = () => {
+    return {
+      brand: Platform.OS === 'android' ? Platform.constants.Brand : 'Apple',
+      model: Platform.OS === 'android' ? Platform.constants.Model : 'iOS Device',
+      os: Platform.OS,
+      osVersion: Platform.Version.toString(),
+    };
+  };
+  
+  // Generate metadata for recording
+  const generateMetadata = (): RecordingMetadata => {
+    const { width, height } = Dimensions.get('window');
+    const { scale, fontScale } = Dimensions.get('screen');
+    
+    return {
+      deviceId: uuid.v4(), // You might want to use a library like react-native-device-info to get a unique ID
+      timestamp: new Date().toISOString(),
+      location: location || undefined,
+      deviceInfo: getDeviceInfo(),
+      cameraInfo: {
+        id: device?.id || 'unknown',
+        position: device?.position?.toString() || 'back',
+        resolution: {
+          width: device?.formats?.[0]?.videoWidth || 1920,
+          height: device?.formats?.[0]?.videoHeight || 1080,
+        },
+      },
+      viewport: {
+        width,
+        height,
+        scale,
+        fontScale,
+      },
+      orientation: deviceOrientation,
+      gyro: gyroData || undefined,
+      recordingSettings: {
+        codec: 'h264',
+        quality: '480p',
+        bitrate: 8000000, // 8 Mbps
+      },
+    };
   };
 
   const handleOpenCamera = async () => {
     const granted = await requestPermissions();
     if (granted) {
       setShowCamera(true);
+      startOrientationTracking();
+      startGyroTracking();
+      startLocationTracking();
     }
   };
+  
+  // Cleanup function for effects
+  useEffect(() => {
+    return () => {
+      // Clean up subscriptions
+      if (gyroSubscription.current) {
+        gyroSubscription.current.remove();
+      }
+      if (locationSubscription.current) {
+        locationSubscription.current.remove();
+      }
+      // Clean up any other resources
+    };
+  }, []);
 
   // Start recording session with backend
   const handleStartRecording = async () => {
@@ -209,15 +453,18 @@ export default function App() {
   const startRecordingSegment = () => {
     if (!camera.current) return;
     
+    // Generate metadata for this recording segment
+    const metadata = generateMetadata();
+    
     camera.current.startRecording({
       fileType: 'mp4', // Ensures .mp4 output
       onRecordingFinished: async (video) => {
         console.log('Video segment saved to:', video.path);
         
         try {
-          // Upload video chunk to backend
+          // Upload video chunk to backend with metadata
           setUploadStatus('Uploading...');
-          const uploadResponse = await uploadVideoChunk(video.path);
+          const uploadResponse = await uploadVideoChunk(video.path, metadata);
           console.log('Video uploaded:', uploadResponse);
           setUploadStatus('Uploaded successfully');
           
