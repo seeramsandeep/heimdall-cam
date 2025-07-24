@@ -1,746 +1,1145 @@
 import React, { useRef, useState, useEffect } from 'react';
 import {
   View,
-  StyleSheet,
   Text,
   TouchableOpacity,
-  PermissionsAndroid,
-  Platform,
-  Animated,
-  Easing,
+  StyleSheet,
   Alert,
+  AppState,
   Dimensions,
-  NativeModules,
-  NativeEventEmitter,
+  StatusBar,
+  Platform,
+  PermissionsAndroid,
+  Linking,
 } from 'react-native';
 import {
   Camera,
   useCameraDevices,
-  CameraPermissionStatus,
+  useCameraPermission,
+  useMicrophonePermission,
+  getCameraDevice,
 } from 'react-native-vision-camera';
-import type { Camera as CameraType } from 'react-native-vision-camera';
+import { io } from 'socket.io-client';
+import DeviceInfo from 'react-native-device-info';
 import RNFS from 'react-native-fs';
-import 'react-native-get-random-values';
-import uuid from 'react-native-uuid';
 
-
-// Backend API configuration
-// const BACKEND_URL = 'http://localhost:3001'; // Change this to your backend URL
-// const BACKEND_URL = 'http://192.168.1.100:3001'; // Change this to your backend URL
-// const BACKEND_URL = 'http://10.0.2.2:3001'; // Change this to your backend URL
-
-// Ngrok URL
-const BACKEND_URL = 'https://aaa69efce64b.ngrok-free.app'; // Change this to your backend URL
-
-// API functions
-const apiCall = async (endpoint: string, method: string = 'GET', body?: any) => {
-  try {
-    const response = await fetch(`${BACKEND_URL}${endpoint}`, {
-      method,
-      headers: {
-        'Content-Type': 'application/json',
-      },
-      body: body ? JSON.stringify(body) : undefined,
-    });
-    return await response.json();
-  } catch (error) {
-    console.error('API call failed:', error);
-    throw error;
-  }
-};
-
-// const uploadVideoChunk = async (videoPath: string) => {
-//   try {
-//     const formData = new FormData();
-//     formData.append('video', {
-//       uri: videoPath,
-//       type: 'video/mp4',
-//       name: `video_${Date.now()}.mp4`,
-//     } as any);
-
-//     const response = await fetch(`${BACKEND_URL}/upload-chunk`, {
-//       method: 'POST',
-//       // headers: {
-//       //   'Content-Type': 'multipart/form-data',
-//       // },
-//       body: formData,
-//     });
-
-//     return await response.json();
-//   } catch (error) {
-//     console.error('Video upload failed:', error);
-//     throw error;
-//   }
-// };
-
-
-
-// Types for metadata
-interface RecordingMetadata {
-  deviceId: string;
-  timestamp: string;
-  location?: {
-    latitude: number;
-    longitude: number;
-    accuracy: number;
-  };
-  deviceInfo: {
-    brand: string;
-    model: string;
-    os: string;
-    osVersion: string;
-  };
-  cameraInfo: {
-    id: string;
-    position: string; // Can be 'front', 'back', or 'external'
-    resolution: {
-      width: number;
-      height: number;
-    };
-  };
-  viewport: {
-    width: number;
-    height: number;
-    scale: number;
-    fontScale: number;
-  };
-  orientation: 'portrait' | 'landscape';
-  gyro?: {
-    x: number;
-    y: number;
-    z: number;
-  };
-  recordingSettings: {
-    codec: string;
-    quality: string;
-    bitrate: number;
-  };
-}
+const { width, height } = Dimensions.get('window');
+const BACKEND_URL = 'https://0cc63893afff.ngrok-free.app'; // Replace with your ngrok URL
+const CHUNK_DURATION = 5 * 60 * 1000; // 5 minutes
 
 export default function App() {
-  const camera = useRef<CameraType>(null);
-  // Track the current chunk index
-const currentChunkIndex = useRef(0);
-  const [hasPermission, setHasPermission] = useState(false);
-  const [showCamera, setShowCamera] = useState(false);
-  const [showSplash, setShowSplash] = useState(true);
+  const camera = useRef<Camera>(null);
+  const [isStreaming, setIsStreaming] = useState(false);
   const [isRecording, setIsRecording] = useState(false);
-  const [sessionId, setSessionId] = useState<string | null>(null);
-  const [uploadStatus, setUploadStatus] = useState<string>('Ready');
-  const [deviceOrientation, setDeviceOrientation] = useState<'portrait' | 'landscape'>(
-    Dimensions.get('window').width > Dimensions.get('window').height ? 'landscape' : 'portrait'
-  );
-  const [location, setLocation] = useState<{latitude: number, longitude: number, accuracy: number} | null>(null);
-  const [gyroData, setGyroData] = useState<{x: number, y: number, z: number} | null>(null);
-  
-  const recordingTimer = useRef<NodeJS.Timeout | null>(null);
-  const isSegmentProcessing = useRef(false);
-  const gyroSubscription = useRef<{remove: () => void} | null>(null);
-  const locationSubscription = useRef<{remove: () => void} | null>(null);
+  const [sessionId, setSessionId] = useState('');
+  const [deviceId, setDeviceId] = useState('');
+  const [socket, setSocket] = useState<any>(null);
+  const [connectionStatus, setConnectionStatus] = useState('Disconnected');
+  const [analysisResults, setAnalysisResults] = useState<any[]>([]);
+  const [chunkCount, setChunkCount] = useState(0);
+  const [isInitialized, setIsInitialized] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [permissionStatus, setPermissionStatus] = useState('checking');
+  const [cameraDevice, setCameraDevice] = useState<any>(null);
+  const [deviceCheckCount, setDeviceCheckCount] = useState(0);
+  const [uploadStatus, setUploadStatus] = useState('');
+  const [streamingStatus, setStreamingStatus] = useState('');
+  const [videoStreamActive, setVideoStreamActive] = useState(false);
+  const [deviceInfo, setDeviceInfo] = useState<any>(null);
 
-  // Animation for the "Open Camera" button
-  const pulseAnim = useRef(new Animated.Value(1)).current;
+  // WebRTC and streaming refs
+  const frameIntervalRef = useRef<NodeJS.Timeout | null>(null);
 
+  const { hasPermission: cameraPermission, requestPermission: requestCameraPermission } = useCameraPermission();
+  const { hasPermission: microphonePermission, requestPermission: requestMicrophonePermission } = useMicrophonePermission();
   const devices = useCameraDevices();
-  const device = devices.find(device => device.position === 'back');
 
+  useEffect(() => {
+    console.log('App mounted, initializing...');
+    checkAndRequestPermissions();
+  }, []);
 
+  useEffect(() => {
+    console.log('Camera devices updated:', devices);
+    if (devices && Object.keys(devices).length > 0) {
+      findCameraDevice();
+    }
+  }, [devices]);
 
-function getMimeType(ext: string) {
-  switch (ext.toLowerCase()) {
-    case 'mp4':
-      return 'video/mp4';
-    case 'mov':
-      return 'video/quicktime';
-    case 'mkv':
-      return 'video/x-matroska';
-    default:
-      return 'application/octet-stream';
-  }
-}
+  useEffect(() => {
+    if (isInitialized && !cameraDevice && deviceCheckCount < 10) {
+      const timer = setTimeout(() => {
+        console.log(`Retrying camera device detection... Attempt ${deviceCheckCount + 1}`);
+        setDeviceCheckCount(prev => prev + 1);
+        findCameraDevice();
+      }, 1000);
+      return () => clearTimeout(timer);
+    }
+  }, [isInitialized, cameraDevice, deviceCheckCount]);
 
-const uploadVideoChunk = async (videoPath: string, metadata: RecordingMetadata) => {
-  try {
-    const ext = videoPath.split('.').pop() || 'mov';
-    const mimeType = getMimeType(ext);
-    const timestamp = new Date().toISOString();
-    const chunkIndex = currentChunkIndex.current;
+  const getAllDeviceInfo = () => {
+    if (!devices || Object.keys(devices).length === 0) {
+      console.log('❌ No camera devices available');
+      return [];
+    }
 
-    const formData = new FormData();
+    const deviceInfo: any[] = [];
     
-    // Append video file
-    formData.append('video', {
-      uri: Platform.OS === 'android' ? 'file://' + videoPath : videoPath,
-      type: mimeType,
-      name: `video_${Date.now()}.${ext}`,
-    } as any);
-    
-    // Append metadata as a JSON string
-    const metadataBlob = new Blob(
-      [JSON.stringify({
-        ...metadata,
-        chunkTimestamp: timestamp,
-        chunkIndex: chunkIndex,
-      })],
-      { 
-        type: 'application/json',
-        // @ts-ignore - BlobOptions type is not fully compatible with React Native
-        lastModified: Date.now()
-      }
-    );
-    
-    formData.append('metadata', {
-      uri: `data:application/json;base64,${await blobToBase64(metadataBlob)}`,
-      type: 'application/json',
-      name: 'metadata.json',
-    } as any);
-
-    console.log(`Uploading chunk ${chunkIndex} with metadata:`, 
-      JSON.stringify(metadata, null, 2));
+    Object.entries(devices).forEach(([key, device]) => {
+      if (!device) return;
       
-    const response = await fetch(`${BACKEND_URL}/upload-chunk`, {
-      method: 'POST',
-      body: formData,
-      headers: {
-        'Content-Type': 'multipart/form-data',
-      },
+      const info = {
+        key: key,
+        id: device.id,
+        name: device.name || `Camera ${device.id}`,
+        position: device.position,
+        hasFlash: device.hasFlash,
+        hasTorch: device.hasTorch,
+        supportsLowLightBoost: device.supportsLowLightBoost,
+        supportsFocus: device.supportsFocus,
+        supportsRawCapture: device.supportsRawCapture,
+        isMultiCam: device.isMultiCam,
+        hardwareLevel: device.hardwareLevel,
+        sensorOrientation: device.sensorOrientation,
+        minZoom: device.minZoom,
+        maxZoom: device.maxZoom,
+        neutralZoom: device.neutralZoom,
+        minFocusDistance: device.minFocusDistance,
+        minExposure: device.minExposure,
+        maxExposure: device.maxExposure,
+        physicalDevices: device.physicalDevices || [],
+        formatCount: device.formats?.length || 0,
+        bestVideoFormats: device.formats
+          ?.filter(f => f.videoWidth && f.videoHeight)
+          ?.sort((a, b) => (b.videoWidth * b.videoHeight) - (a.videoWidth * a.videoHeight))
+          ?.slice(0, 3)
+          ?.map(f => ({
+            resolution: `${f.videoWidth}x${f.videoHeight}`,
+            fps: `${f.minFps}-${f.maxFps}`,
+            photoRes: `${f.photoWidth}x${f.photoHeight}`,
+            autoFocus: f.autoFocusSystem,
+            hdr: f.supportsVideoHdr,
+            stabilization: f.videoStabilizationModes?.join(', '),
+            fieldOfView: f.fieldOfView?.toFixed(1),
+            isoRange: `${f.minISO}-${f.maxISO}`,
+          })) || [],
+      };
+      
+      deviceInfo.push(info);
     });
-
-    const result = await response.json();
-    console.log(`Chunk ${chunkIndex} upload response:`, result);
     
-    // Increment chunk index for next upload
-    currentChunkIndex.current += 1;
-    
-    return result;
-  } catch (error) {
-    console.error('Video upload failed:', error);
-    throw error;
-  }
-};
-
-// Helper function to convert Blob to base64
-const blobToBase64 = (blob: Blob): Promise<string> => {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => {
-      const base64String = (reader.result as string).split(',')[1];
-      resolve(base64String);
-    };
-    reader.onerror = reject;
-    reader.readAsDataURL(blob);
-  });
-};
-
-  // Splash screen effect
-  useEffect(() => {
-    const timer = setTimeout(() => setShowSplash(false), 2000); // 2 seconds splash
-    return () => clearTimeout(timer);
-  }, []);
-
-  // Button pulse animation
-  useEffect(() => {
-    if (!showSplash && !showCamera) {
-      Animated.loop(
-        Animated.sequence([
-          Animated.timing(pulseAnim, {
-            toValue: 1.15,
-            duration: 700,
-            useNativeDriver: true,
-            easing: Easing.inOut(Easing.ease),
-          }),
-          Animated.timing(pulseAnim, {
-            toValue: 1,
-            duration: 700,
-            useNativeDriver: true,
-            easing: Easing.inOut(Easing.ease),
-          }),
-        ])
-      ).start();
-    }
-  }, [showSplash, showCamera, pulseAnim]);
-
-  // Request all necessary permissions
-  const requestPermissions = async () => {
-    // Camera and microphone permissions
-    const cameraPermission: CameraPermissionStatus = await Camera.requestCameraPermission();
-    const micPermission: CameraPermissionStatus = await Camera.requestMicrophonePermission();
-    
-    // Location permission
-    let locationPermission = false;
-    if (Platform.OS === 'android') {
-      locationPermission = await PermissionsAndroid.check(
-        PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION
-      );
-      if (!locationPermission) {
-        locationPermission = (await PermissionsAndroid.request(
-          PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION
-        )) === 'granted';
-      }
-    } else {
-      // For iOS, you'll need to handle location permissions differently
-      // This is a simplified version
-      locationPermission = true;
-    }
-
-    const granted = cameraPermission === 'granted' && micPermission === 'granted';
-    setHasPermission(granted);
-
-    if (Platform.OS === 'android' && granted) {
-      await PermissionsAndroid.request(PermissionsAndroid.PERMISSIONS.RECORD_AUDIO);
-    }
-    
-    return granted;
+    return deviceInfo;
   };
-  
-  // Start tracking device orientation
-  const startOrientationTracking = () => {
-    Dimensions.addEventListener('change', ({ window }) => {
-      setDeviceOrientation(
-        window.width > window.height ? 'landscape' : 'portrait'
-      );
-    });
-  };
-  
-  // Start gyroscope tracking
-  const startGyroTracking = async () => {
+
+  const findCameraDevice = () => {
     try {
-      // This is a simplified version - you'll need to implement or use a library
-      // like expo-sensors for cross-platform gyroscope support
-      if (Platform.OS === 'android' && NativeModules.DeviceMotion) {
-        const DeviceMotion = new NativeEventEmitter(NativeModules.DeviceMotion);
-        gyroSubscription.current = DeviceMotion.addListener(
-          'RotationRate',
-          (data) => {
-            setGyroData({
-              x: data.x,
-              y: data.y,
-              z: data.z
-            });
-          }
-        );
+      console.log('🔍 Finding camera device...');
+      const allDevices = getAllDeviceInfo();
+      console.log('📱 Available camera devices:');
+      allDevices.forEach((device: any, index: number) => {
+        console.log(`\n📷 Device ${index + 1}:`);
+        console.log(`  ID: ${device.id}`);
+        console.log(`  Name: ${device.name}`);
+        console.log(`  Position: ${device.position}`);
+        console.log(`  Flash: ${device.hasFlash ? '✅' : '❌'}`);
+        console.log(`  Torch: ${device.hasTorch ? '✅' : '❌'}`);
+        console.log(`  Focus: ${device.supportsFocus ? '✅' : '❌'}`);
+        console.log(`  Hardware Level: ${device.hardwareLevel}`);
+        console.log(`  Zoom Range: ${device.minZoom}x - ${device.maxZoom}x`);
+        console.log(`  Total Formats: ${device.formatCount}`);
+      });
+
+      let device: any = null;
+      let selectedDeviceInfo: any = null;
+
+      // devices is an array, so use array methods
+      if (Array.isArray(devices)) {
+        device = devices.find((d: any) => d.position === 'back') || devices[0];
+        selectedDeviceInfo = allDevices.find((d: any) => d.position === (device ? device.position : 'back')) || allDevices[0];
+      } else if (devices) {
+        // fallback for object (shouldn't happen)
+        const deviceArr = Object.values(devices);
+        device = deviceArr.find((d: any) => d.position === 'back') || deviceArr[0];
+        selectedDeviceInfo = allDevices.find((d: any) => d.position === (device ? device.position : 'back')) || allDevices[0];
+      }
+
+      if (device && selectedDeviceInfo) {
+        console.log('\n🎯 Final Camera Selection:');
+        console.log(`   Device ID: ${selectedDeviceInfo.id}`);
+        console.log(`   Name: ${selectedDeviceInfo.name}`);
+        console.log(`   Position: ${selectedDeviceInfo.position}`);
+        console.log(`   Available Formats: ${selectedDeviceInfo.formatCount}`);
+        setCameraDevice(device);
+        setDeviceInfo(selectedDeviceInfo);
+      } else {
+        console.log('\n❌ No suitable camera device found');
+        if (deviceCheckCount >= 9) {
+          setError('No camera device available. Please check if your device has a working camera.');
+        }
       }
     } catch (error) {
-      console.warn('Gyroscope not available', error);
-    }
-  };
-  
-  // Start location tracking
-  const startLocationTracking = async () => {
-    try {
-      // This is a simplified version - you'll need to implement or use a library
-      // like expo-location for cross-platform location support
-      if (Platform.OS === 'android' && NativeModules.LocationManager) {
-        const LocationManager = new NativeEventEmitter(NativeModules.LocationManager);
-        locationSubscription.current = LocationManager.addListener(
-          'onLocationChanged',
-          (location) => {
-            setLocation({
-              latitude: location.latitude,
-              longitude: location.longitude,
-              accuracy: location.accuracy
-            });
-          }
-        );
+      if (error instanceof Error) {
+        console.error('❌ Error finding camera device:', error.message);
+        setError(`Camera detection error: ${error.message}`);
+      } else {
+        console.error('❌ Error finding camera device:', error);
+        setError('Camera detection error');
       }
-    } catch (error) {
-      console.warn('Location tracking not available', error);
     }
-  };
-  
-  // Get device info
-  const getDeviceInfo = () => {
-    return {
-      brand: Platform.OS === 'android' ? Platform.constants.Brand : 'Apple',
-      model: Platform.OS === 'android' ? Platform.constants.Model : 'iOS Device',
-      os: Platform.OS,
-      osVersion: Platform.Version.toString(),
-    };
-  };
-  
-  // Generate metadata for recording
-  const generateMetadata = (): RecordingMetadata => {
-    const { width, height } = Dimensions.get('window');
-    const { scale, fontScale } = Dimensions.get('screen');
-    
-    return {
-      deviceId: uuid.v4(), // You might want to use a library like react-native-device-info to get a unique ID
-      timestamp: new Date().toISOString(),
-      location: location || undefined,
-      deviceInfo: getDeviceInfo(),
-      cameraInfo: {
-        id: device?.id || 'unknown',
-        position: device?.position?.toString() || 'back',
-        resolution: {
-          width: device?.formats?.[0]?.videoWidth || 1920,
-          height: device?.formats?.[0]?.videoHeight || 1080,
-        },
-      },
-      viewport: {
-        width,
-        height,
-        scale,
-        fontScale,
-      },
-      orientation: deviceOrientation,
-      gyro: gyroData || undefined,
-      recordingSettings: {
-        codec: 'h264',
-        quality: '480p',
-        bitrate: 8000000, // 8 Mbps
-      },
-    };
   };
 
-  const handleOpenCamera = async () => {
-    const granted = await requestPermissions();
-    if (granted) {
-      setShowCamera(true);
-      startOrientationTracking();
-      startGyroTracking();
-      startLocationTracking();
-    }
-  };
-  
-  // Cleanup function for effects
-  useEffect(() => {
-    return () => {
-      // Clean up subscriptions
-      if (gyroSubscription.current) {
-        gyroSubscription.current.remove();
-      }
-      if (locationSubscription.current) {
-        locationSubscription.current.remove();
-      }
-      // Clean up any other resources
-    };
-  }, []);
-
-  // Start recording session with backend
-  const handleStartRecording = async () => {
-    if (!camera.current) return;
-    
+  const checkAndRequestPermissions = async () => {
     try {
-      // Start recording session on backend
-      const response = await apiCall('/start-recording', 'POST');
-      if (response.error) {
-        Alert.alert('Backend Error', response.error);
-        setUploadStatus('Backend error: ' + response.error);
-        setIsRecording(false);
+      setPermissionStatus('checking');
+      console.log('Checking permissions...');
+
+      const cameraStatus = await PermissionsAndroid.check(PermissionsAndroid.PERMISSIONS.CAMERA);
+      const audioStatus = await PermissionsAndroid.check(PermissionsAndroid.PERMISSIONS.RECORD_AUDIO);
+      
+      console.log('Current permissions - Camera:', cameraStatus, 'Audio:', audioStatus);
+
+      if (cameraStatus && audioStatus) {
+        console.log('All permissions already granted');
+        await initializeApp();
         return;
       }
-      setSessionId(response.sessionId);
-      setUploadStatus('Recording started');
+
+      if (!cameraStatus) {
+        console.log('Requesting camera permission...');
+        const cameraResult = await PermissionsAndroid.request(
+          PermissionsAndroid.PERMISSIONS.CAMERA,
+          {
+            title: 'Heimdall Camera Permission',
+            message: 'Heimdall needs access to your camera for security monitoring',
+            buttonNeutral: 'Ask Me Later',
+            buttonNegative: 'Cancel',
+            buttonPositive: 'OK',
+          }
+        );
+        
+        if (cameraResult !== PermissionsAndroid.RESULTS.GRANTED) {
+          setError('Camera permission is required for the app to work');
+          setPermissionStatus('denied');
+          return;
+        }
+      }
+
+      if (!audioStatus) {
+        console.log('Requesting audio permission...');
+        const audioResult = await PermissionsAndroid.request(
+          PermissionsAndroid.PERMISSIONS.RECORD_AUDIO,
+          {
+            title: 'Heimdall Microphone Permission',
+            message: 'Heimdall needs access to your microphone for audio recording',
+            buttonNeutral: 'Ask Me Later',
+            buttonNegative: 'Cancel',
+            buttonPositive: 'OK',
+          }
+        );
+        
+        if (audioResult !== PermissionsAndroid.RESULTS.GRANTED) {
+          setError('Microphone permission is required for audio recording');
+          setPermissionStatus('denied');
+          return;
+        }
+      }
+
+      console.log('All permissions granted, initializing app...');
+      await initializeApp();
+
+    } catch (error) {
+      console.error('Permission request error:', error);
+      setError(`Permission error: ${error}`);
+      setPermissionStatus('error');
+    }
+  };
+
+  const initializeApp = async () => {
+    try {
+      console.log('Initializing app...');
+      setPermissionStatus('granted');
       
+      if (!cameraPermission) {
+        console.log('Requesting Vision Camera permission...');
+        const visionCameraResult = await requestCameraPermission();
+        if (!visionCameraResult) {
+          setError('Vision Camera permission denied');
+          return;
+        }
+      }
+
+      if (!microphonePermission) {
+        console.log('Requesting Vision Camera microphone permission...');
+        const visionMicResult = await requestMicrophonePermission();
+        if (!visionMicResult) {
+          setError('Vision Camera microphone permission denied');
+          return;
+        }
+      }
+
+      console.log('Getting device ID...');
+      const id = await DeviceInfo.getUniqueId();
+      setDeviceId(id);
+      
+      const newSessionId = `${id}-${Date.now()}`;
+      setSessionId(newSessionId);
+      
+      setIsInitialized(true);
+      setError(null);
+      console.log('App initialized successfully');
+
+      findCameraDevice();
+      
+    } catch (error) {
+      console.error('Initialization error:', error);
+      setError(`Initialization failed: ${error}`);
+    }
+  };
+
+  const testBackendConnection = async () => {
+    try {
+      console.log('🔍 Testing backend connection...');
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => {
+        controller.abort();
+        console.log('⏰ Backend connection test timeout');
+      }, 8000);
+      const response = await fetch(`${BACKEND_URL}/health`, {
+        method: 'GET',
+        headers: {
+          'ngrok-skip-browser-warning': 'true',
+          'Content-Type': 'application/json',
+          'Accept': 'application/json',
+        },
+        signal: controller.signal,
+      });
+      clearTimeout(timeoutId);
+      if (response.ok) {
+        const data = await response.json();
+        console.log('✅ Backend is reachable:', data);
+        return true;
+      } else {
+        console.log('❌ Backend responded with error:', response.status, await response.text());
+        return false;
+      }
+    } catch (error) {
+      if (error instanceof Error && error.name === 'AbortError') {
+        console.error('❌ Backend connection test timeout');
+      } else {
+        console.error('❌ Backend connection test failed:', error);
+      }
+      return false;
+    }
+  };
+
+  const connectToServer = async () => {
+    try {
+      console.log('Testing backend connection first...');
+      const isBackendReachable = await testBackendConnection();
+      
+      if (!isBackendReachable) {
+        throw new Error('Backend server not reachable');
+      }
+
+      console.log('Creating socket connection to:', BACKEND_URL);
+      
+      const newSocket = io(BACKEND_URL, {
+        transports: ['websocket'],
+        timeout: 15000,
+        reconnection: true,
+        reconnectionDelay: 2000,
+        reconnectionAttempts: 5,
+        forceNew: true,
+        extraHeaders: {
+          'ngrok-skip-browser-warning': 'true'
+        }
+      });
+
+      return new Promise((resolve, reject) => {
+        const connectionTimeout = setTimeout(() => {
+          console.error('Socket connection timeout after 15 seconds');
+          newSocket.disconnect();
+          reject(new Error('Connection timeout'));
+        }, 15000);
+
+        newSocket.on('connect', () => {
+          clearTimeout(connectionTimeout);
+          console.log('✅ Socket connected successfully');
+          setConnectionStatus('Connected');
+          newSocket.emit('register-device', { deviceId, sessionId });
+          resolve(newSocket);
+        });
+
+        newSocket.on('connect_error', (error) => {
+          clearTimeout(connectionTimeout);
+          console.error('❌ Socket connection failed:', error);
+          newSocket.disconnect();
+          reject(error);
+        });
+
+        newSocket.on('disconnect', (reason) => {
+          console.log('Socket disconnected:', reason);
+          setConnectionStatus('Disconnected');
+        });
+
+        newSocket.on('analysis-result', (data) => {
+          console.log('Received analysis result:', data);
+          setAnalysisResults(prev => [...prev, data]);
+        });
+
+        newSocket.on('error', (error) => {
+          console.error('Socket error:', error);
+        });
+      });
+
+    } catch (error) {
+      console.error('Connection setup failed:', error);
+      setConnectionStatus('Connection Failed');
+      throw error;
+    }
+  };
+
+  const startVideoStreaming = async (socketConnection: any) => {
+    try {
+      console.log('🎥 Starting WebRTC video streaming...');
+      setStreamingStatus('Initializing video stream...');
+      if (!camera.current) {
+        throw new Error('Camera not available');
+      }
+      setVideoStreamActive(true);
+      setStreamingStatus('Video stream active');
+      startSmoothFrameStreaming(socketConnection);
+      console.log('✅ WebRTC video streaming started');
+    } catch (error: any) {
+      if (error instanceof Error) {
+        console.error('❌ Video streaming setup failed:', error.message);
+        setStreamingStatus('Video streaming failed');
+        throw error;
+      } else {
+        console.error('❌ Video streaming setup failed:', error);
+        setStreamingStatus('Video streaming failed');
+        throw new Error('Video streaming failed');
+      }
+    }
+  };
+
+  const startSmoothFrameStreaming = (socketConnection: any) => {
+    console.log('🎬 Starting smooth frame streaming...');
+    let frameCount = 0;
+    frameIntervalRef.current = setInterval(async () => {
+      try {
+        if (!camera.current || !(socketConnection && socketConnection.connected) || !videoStreamActive) {
+          if (!camera.current) {
+            console.log('Camera ref is null in frame streaming!');
+          }
+          if (!(socketConnection && socketConnection.connected)) {
+            console.log('Socket not connected in frame streaming!');
+          }
+          if (!videoStreamActive) {
+            console.log('Video stream not active in frame streaming!');
+          }
+          return;
+        }
+        let photo;
+        try {
+          photo = await camera.current.takePhoto({ flash: 'off' });
+        } catch (err) {
+          console.error('Error taking photo for streaming:', err);
+          return;
+        }
+        frameCount++;
+        const frameData = await convertImageToBase64Fast(photo.path);
+        if (frameData) {
+          console.log('Emitting live-video-frame', { deviceId, frameNumber: frameCount, frameData: frameData.substring(0, 30) });
+          socketConnection.emit('live-video-frame', {
+            deviceId,
+            sessionId,
+            frame: frameData,
+            timestamp: Date.now(),
+            frameNumber: frameCount,
+            streamType: 'live',
+            fps: 10,
+          });
+          if (frameCount % 30 === 0) {
+            console.log(`📹 Streaming frame ${frameCount} (10 FPS)`);
+            setStreamingStatus(`Live streaming: ${frameCount} frames`);
+          }
+        }
+      } catch (error: any) {
+        if (error && error.code === 'capture/photo-not-enabled') {
+          console.error('❌ Photo capture not enabled for streaming');
+          stopVideoStreaming();
+        } else {
+          console.error('❌ Frame streaming error:', error);
+        }
+      }
+    }, 100); // 100ms = 10 FPS
+  };
+
+  const convertImageToBase64Fast = async (imagePath: string) => {
+    try {
+      const fileUri = imagePath.startsWith('file://') ? imagePath : `file://${imagePath}`;
+      const base64Data = await RNFS.readFile(fileUri, 'base64');
+      return `data:image/jpeg;base64,${base64Data}`;
+    } catch (error) {
+      console.error('Base64 conversion error:', error);
+      return null;
+    }
+  };
+
+  const startStreaming = async () => {
+    try {
+      if (!cameraDevice) {
+        Alert.alert('Camera Error', 'Camera device not available. Please restart the app.');
+        return;
+      }
+
+      setIsStreaming(true);
+      setConnectionStatus('Connecting...');
+      setError(null);
+      
+      console.log('🚀 Starting enhanced video streaming...');
+
+      let connectedSocket: any;
+      try {
+        connectedSocket = await connectToServer();
+        setSocket(connectedSocket);
+        console.log('✅ Socket connection established');
+        connectedSocket.emit('start-stream', { deviceId, sessionId });
+      } catch (connectionError: any) {
+        console.error('❌ Failed to connect to server:', connectionError);
+        setIsStreaming(false);
+        setConnectionStatus('Connection Failed');
+        Alert.alert('Connection Failed', `Unable to connect to server: ${connectionError.message}`);
+        return;
+      }
+
+      if (!connectedSocket || !connectedSocket.connected) {
+        console.error('❌ Socket not properly connected');
+        setIsStreaming(false);
+        setConnectionStatus('Connection Failed');
+        return;
+      }
+
+      await new Promise(resolve => setTimeout(resolve, 1000));
+
+      setConnectionStatus('Starting Video Stream...');
+
+      await startVideoStreaming(connectedSocket);
+      await startChunkedRecording();
+
+      setConnectionStatus('Live Streaming');
+      console.log('✅ Enhanced streaming started successfully');
+
+    } catch (error: any) {
+      console.error('❌ Start streaming error:', error);
+      setIsStreaming(false);
+      setConnectionStatus('Connection Failed');
+      setError(`Failed to start streaming: ${error.message}`);
+    }
+  };
+
+  const startChunkedRecording = async () => {
+    try {
+      console.log('Starting chunked recording...');
       setIsRecording(true);
       
-      // Start recording with 10-second segments
-      startRecordingSegment();
-      
-      // Set up timer to create new segments every 10 seconds
-      const timer = setInterval(() => {
-        restartRecordingSegment();  
-      }, 10000); // 10 seconds
-      
-      recordingTimer.current = timer;
-      
-    } catch (error) {
-      console.error('Failed to start recording session:', error);
-      Alert.alert('Error', 'Failed to start recording session');
-    }
-  };
-  
-  const startRecordingSegment = () => {
-    if (!camera.current) return;
-    
-    // Generate metadata for this recording segment
-    const metadata = generateMetadata();
-    
-    camera.current.startRecording({
-      fileType: 'mp4', // Ensures .mp4 output
-      onRecordingFinished: async (video) => {
-        console.log('Video segment saved to:', video.path);
-        
-        try {
-          // Upload video chunk to backend with metadata
-          setUploadStatus('Uploading...');
-          const uploadResponse = await uploadVideoChunk(video.path, metadata);
-          console.log('Video uploaded:', uploadResponse);
-          setUploadStatus('Uploaded successfully');
-          
-          // Clean up local file after upload
-          await RNFS.unlink(video.path);
-          
-        } catch (error) {
-          console.error('Upload failed:', error);
-          setUploadStatus('Upload failed');
-        }
-      },
-      onRecordingError: (error) => {
-        console.error('Recording error:', error);
-        setUploadStatus('Recording error');
-      },
-    });
-  };
-  
-  const restartRecordingSegment = async () => {
-    if (isSegmentProcessing.current) return;
-
-    isSegmentProcessing.current = true;
-    try {
-      if (camera.current) {
-        await camera.current.stopRecording();
-        // onRecordingFinished will handle the upload
-        // A small delay helps prevent race conditions
-        setTimeout(() => {
-          startRecordingSegment();
-        }, 250);
+      if (!camera.current) {
+        throw new Error('Camera reference not available');
       }
-    } catch (error) {
-      console.error('Error restarting recording segment:', error);
-      setUploadStatus('Error restarting');
-    } finally {
-      // Reset lock after a short delay to allow the next segment to start
+
+      await camera.current.startRecording({
+        flash: 'off',
+        onRecordingFinished: (video) => {
+          console.log('Recording finished:', video);
+          uploadVideoChunk(video);
+        },
+        onRecordingError: (error) => {
+          console.error('Recording error:', error);
+          Alert.alert('Recording Error', error.message);
+        },
+      });
+
       setTimeout(() => {
-        isSegmentProcessing.current = false;
-      }, 500);
+        if (isRecording && camera.current) {
+          camera.current.stopRecording();
+          if (isStreaming) {
+            setChunkCount(prev => prev + 1);
+            startChunkedRecording();
+          }
+        }
+      }, CHUNK_DURATION);
+
+    } catch (error: any) {
+      console.error('Start recording error:', error);
+      setError(`Recording failed: ${error.message}`);
     }
   };
 
-  // Stop recording
-  const handleStopRecording = async () => {
-    if (!isRecording) return;
-
-    setIsRecording(false);
-    setUploadStatus('Stopping...');
-
-    // Clear the recording timer
-    if (recordingTimer.current) {
-      clearInterval(recordingTimer.current);
-      recordingTimer.current = null;
+  const uploadVideoChunk = async (video: { path: string; duration?: number; [key: string]: any }) => {
+    const chunkId = `${sessionId}-chunk-${chunkCount}`;
+    setUploadStatus(`Uploading chunk ${chunkCount}...`);
+    
+    if (!video || !video.path) {
+      console.error('❌ Invalid video object:', video);
+      setUploadStatus('Upload failed: Invalid video file');
+      return;
     }
 
+    const formData = new FormData();
+    formData.append('video', {
+      uri: video.path,
+      type: 'video/mp4',
+      name: `${chunkId}.mp4`,
+    } as any);
+    formData.append('sessionId', sessionId);
+    formData.append('deviceId', deviceId);
+    formData.append('chunkId', chunkId);
+
+    let retryCount = 0;
+    const maxRetries = 3;
+
+    while (retryCount < maxRetries) {
+      try {
+        console.log(`📤 Upload attempt ${retryCount + 1}/${maxRetries} for chunk ${chunkCount}`);
+        
+        const isBackendReachable = await testBackendConnection();
+        if (!isBackendReachable) {
+          throw new Error('Backend server not reachable');
+        }
+
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => {
+          controller.abort();
+          console.log('⏰ Upload timeout after 90 seconds');
+        }, 90000);
+
+        const response = await fetch(`${BACKEND_URL}/upload-chunk`, {
+          method: 'POST',
+          body: formData,
+          headers: {
+            'ngrok-skip-browser-warning': 'true',
+          },
+          signal: controller.signal,
+        });
+
+        clearTimeout(timeoutId);
+
+        if (response.ok) {
+          const result = await response.json();
+          console.log(`✅ Chunk ${chunkCount} uploaded successfully:`, result);
+          setUploadStatus(`✅ Chunk ${chunkCount} uploaded successfully`);
+          
+          if (socket && socket.connected) {
+            socket.emit('chunk-uploaded', { chunkId, sessionId, deviceId });
+          }
+          
+          setTimeout(() => setUploadStatus(''), 3000);
+          return;
+          
+        } else {
+          const errorText = await response.text();
+          console.error(`❌ Upload failed with status: ${response.status}`);
+          console.error('❌ Error response:', errorText);
+          
+          if (response.status >= 500) {
+            throw new Error(`Server error: ${response.status} - ${errorText}`);
+          } else {
+            setUploadStatus(`❌ Upload failed: ${response.status}`);
+            return;
+          }
+        }
+        
+      } catch (error: any) {
+        console.error(`❌ Upload error (Attempt ${retryCount + 1}):`, error);
+        retryCount++;
+        
+        let errorMessage = 'Unknown error';
+        
+        if (error.name === 'AbortError') {
+          errorMessage = 'Request timeout';
+          setUploadStatus('❌ Upload timeout');
+        } else if (error.message && error.message.includes('Network request failed')) {
+          errorMessage = 'Network connectivity issue';
+          setUploadStatus(`❌ Network error (${retryCount}/${maxRetries})`);
+        } else if (error.message && error.message.includes('not reachable')) {
+          errorMessage = 'Backend server not accessible';
+          setUploadStatus(`❌ Server unreachable (${retryCount}/${maxRetries})`);
+        } else {
+          errorMessage = error.message;
+          setUploadStatus(`❌ Upload error: ${error.message}`);
+        }
+        
+        console.log(`🔄 Will retry in ${Math.pow(2, retryCount)}s due to: ${errorMessage}`);
+        
+        if (retryCount < maxRetries) {
+          const delay = Math.pow(2, retryCount) * 1000;
+          await new Promise(resolve => setTimeout(resolve, delay));
+        }
+      }
+    }
+    
+    setUploadStatus(`❌ Upload failed after ${maxRetries} attempts`);
+    
+    Alert.alert(
+      'Upload Failed',
+      `Failed to upload video chunk after ${maxRetries} attempts.\n\nDiagnostic steps:\n1. Check internet connection\n2. Verify ngrok tunnel is active\n3. Check backend server logs\n4. Try restarting the app`,
+      [
+        { text: 'Retry Now', onPress: () => uploadVideoChunk(video) },
+        { text: 'Skip', style: 'cancel' }
+      ]
+    );
+  };
+
+  const stopVideoStreaming = async () => {
     try {
-      // Stop the camera hardware recording
-      if (camera.current) {
-        await camera.current.stopRecording();
+      console.log('🛑 Stopping video streaming...');
+      
+      setVideoStreamActive(false);
+      setStreamingStatus('');
+
+      if (frameIntervalRef.current) {
+        clearInterval(frameIntervalRef.current);
+        frameIntervalRef.current = null;
       }
 
-      // Notify the backend to stop the session
-      const response = await apiCall('/stop-recording', 'POST');
-      console.log('Stop recording response:', response);
-      setUploadStatus('Stopped');
-      setSessionId(null);
+      if (camera.current) {
+        try {
+          await camera.current.stopRecording();
+          console.log('✅ Camera recording stopped');
+        } catch (error) {
+          console.error('❌ Error stopping camera:', error);
+        }
+      }
+
+      console.log('✅ Video streaming stopped successfully');
 
     } catch (error) {
-      console.error('Failed to stop recording:', error);
-      setUploadStatus('Error stopping');
-      Alert.alert('Error', 'Could not stop recording. Please check backend connection.');
-      setIsRecording(false);
-      setUploadStatus('Error stopping recording');
+      console.error('❌ Stop video streaming error:', error);
     }
   };
 
-  // If not recording, just close camera and return to main screen
-  const handleCloseCamera = async () => {
-    if (isRecording) {
-      await handleStopRecording();
-    } else {
-      setShowCamera(false);
+  const stopStreaming = async () => {
+    try {
+      console.log('🛑 Stopping all streaming...');
+      
+      setIsStreaming(false);
       setIsRecording(false);
-      setUploadStatus('Ready');
-    }
-  };
-  
-  // Check backend health on app start
-  useEffect(() => {
-    const checkBackendHealth = async () => {
-      try {
-        const response = await apiCall('/health');
-        console.log('Backend health:', response);
-      } catch (error) {
-        console.warn('Backend not available:', error);
-        Alert.alert(
-          'Backend Unavailable',
-          'Please make sure the Node.js backend is running on port 3001',
-          [{ text: 'OK' }]
-        );
+      setConnectionStatus('Disconnecting...');
+      setUploadStatus('');
+
+      await stopVideoStreaming();
+
+      if (socket) {
+        try {
+          if (socket.connected) {
+            socket.emit('stop-stream', { deviceId, sessionId });
+          }
+          socket.disconnect();
+          setSocket(null);
+          console.log('✅ Socket disconnected');
+        } catch (error) {
+          console.error('❌ Error disconnecting socket:', error);
+        }
       }
-    };
-    
-    if (!showSplash) {
-      checkBackendHealth();
+
+      const newSessionId = `${deviceId}-${Date.now()}`;
+      setSessionId(newSessionId);
+      setChunkCount(0);
+      setAnalysisResults([]);
+      setConnectionStatus('Disconnected');
+
+      console.log('✅ All streaming stopped successfully');
+
+    } catch (error) {
+      console.error('❌ Stop streaming error:', error);
+      setConnectionStatus('Disconnected');
     }
-  }, [showSplash]);
+  };
 
-  // Splash screen
-  if (showSplash) {
-    return (
-      <View style={styles.splashScreen}>
-        <Text style={styles.splashText}>Heimdall Cam</Text>
-      </View>
+  const getLatestAnalysis = () => {
+    if (analysisResults.length === 0) return 'No analysis available';
+    
+    const latest = analysisResults[analysisResults.length - 1];
+    const labels = latest.labels?.slice(0, 3).map((l: any) => l.description).join(', ') || 'No objects detected';
+    const peopleCount = latest.personDetection?.detectedPersons?.length || 0;
+    
+    return `Objects: ${labels} | People: ${peopleCount}`;
+  };
+
+  const openAppSettings = () => {
+    Alert.alert(
+      'Permission Required',
+      'Please grant camera and microphone permissions in app settings to use Heimdall.',
+      [
+        { text: 'Cancel', style: 'cancel' },
+        { text: 'Open Settings', onPress: () => Linking.openSettings() }
+      ]
     );
-  }
+  };
 
-  // Main screen with animated "Open Camera" button
-  if (!showCamera) {
+  // Error screen
+  if (error) {
     return (
-      <View style={styles.mainScreen}>
-        <Text style={styles.title}>Heimdall Cam</Text>
-        <Animated.View style={{ transform: [{ scale: pulseAnim }] }}>
-          <TouchableOpacity style={styles.openButton} onPress={handleOpenCamera}>
-            <Text style={styles.buttonText}>Open Camera</Text>
+      <View style={styles.errorContainer}>
+        <Text style={styles.brandText}>HEIMDALL</Text>
+        <Text style={styles.errorTitle}>⚠️ Error</Text>
+        <Text style={styles.errorText}>{error}</Text>
+        <View style={styles.buttonContainer}>
+          <TouchableOpacity style={styles.button} onPress={() => {
+            setError(null);
+            setPermissionStatus('checking');
+            setDeviceCheckCount(0);
+            setCameraDevice(null);
+            setConnectionStatus('Disconnected');
+            checkAndRequestPermissions();
+          }}>
+            <Text style={styles.buttonText}>Retry</Text>
           </TouchableOpacity>
-        </Animated.View>
+          {error.includes('permission') && (
+            <TouchableOpacity style={[styles.button, styles.secondaryButton]} onPress={openAppSettings}>
+              <Text style={styles.buttonText}>Open Settings</Text>
+            </TouchableOpacity>
+          )}
+        </View>
       </View>
     );
   }
 
-  // Camera screen with "Record" or "Stop" button
-  if (!device || !hasPermission) {
+  // Permission screens
+  if (permissionStatus === 'checking') {
     return (
-      <View style={styles.loading}>
-        <Text style={{ color: 'white' }}>Loading camera...</Text>
+      <View style={styles.permissionContainer}>
+        <Text style={styles.brandText}>HEIMDALL</Text>
+        <Text style={styles.subtitle}>Security Monitoring</Text>
+        <Text style={styles.permissionText}>Checking permissions...</Text>
       </View>
     );
   }
 
+  if (permissionStatus === 'denied') {
+    return (
+      <View style={styles.permissionContainer}>
+        <Text style={styles.brandText}>HEIMDALL</Text>
+        <Text style={styles.subtitle}>Security Monitoring</Text>
+        <Text style={styles.permissionText}>Camera and microphone permissions are required for security monitoring.</Text>
+        <View style={styles.buttonContainer}>
+          <TouchableOpacity style={styles.button} onPress={checkAndRequestPermissions}>
+            <Text style={styles.buttonText}>Grant Permissions</Text>
+          </TouchableOpacity>
+          <TouchableOpacity style={[styles.button, styles.secondaryButton]} onPress={openAppSettings}>
+            <Text style={styles.buttonText}>Open Settings</Text>
+          </TouchableOpacity>
+        </View>
+      </View>
+    );
+  }
+
+  // Loading screen
+  if (!isInitialized || !cameraDevice) {
+    return (
+      <View style={styles.loadingContainer}>
+        <Text style={styles.brandText}>HEIMDALL</Text>
+        <Text style={styles.loadingText}>
+          {!isInitialized ? 'Initializing...' : `Loading Camera... (${deviceCheckCount}/10)`}
+        </Text>
+        {deviceCheckCount > 5 && (
+          <TouchableOpacity style={styles.button} onPress={() => {
+            setDeviceCheckCount(0);
+            setCameraDevice(null);
+            findCameraDevice();
+          }}>
+            <Text style={styles.buttonText}>Retry Camera Detection</Text>
+          </TouchableOpacity>
+        )}
+      </View>
+    );
+  }
+
+  // Main app interface
   return (
     <View style={styles.container}>
+      <StatusBar backgroundColor="#000" barStyle="light-content" />
+      
+      <View style={styles.header}>
+        <Text style={styles.brandText}>HEIMDALL</Text>
+        <Text style={styles.subtitle}>Live Video Streaming</Text>
+      </View>
+
       <Camera
         ref={camera}
-        style={StyleSheet.absoluteFill}
-        device={device}
+        style={styles.camera}
+        device={cameraDevice}
         isActive={true}
         video={true}
         audio={true}
+        photo={true}
       />
+
+      <View style={styles.statusOverlay}>
+        <View style={[
+          styles.statusDot, 
+          { backgroundColor: videoStreamActive ? '#00ff00' : socket?.connected ? '#ffff00' : '#ff0000' }
+        ]} />
+        <Text style={styles.statusText}>{connectionStatus}</Text>
+      </View>
+
+      {streamingStatus ? (
+        <View style={styles.streamingStatusContainer}>
+          <Text style={styles.streamingStatusText}>📹 {streamingStatus}</Text>
+        </View>
+      ) : null}
+
+      {uploadStatus ? (
+        <View style={styles.uploadStatusContainer}>
+          <Text style={styles.uploadStatusText}>{uploadStatus}</Text>
+        </View>
+      ) : null}
+
+      {analysisResults.length > 0 && (
+        <View style={styles.analysisContainer}>
+          <Text style={styles.analysisTitle}>Live Analysis:</Text>
+          <Text style={styles.analysisText}>{getLatestAnalysis()}</Text>
+        </View>
+      )}
+
       <View style={styles.controls}>
-        {/* Status indicator */}
-        <View style={styles.statusContainer}>
-          <Text style={styles.statusText}>{uploadStatus}</Text>
-          {sessionId && (
-            <Text style={styles.sessionText}>Session: {sessionId.substring(0, 8)}</Text>
+        <View style={styles.sessionInfo}>
+          <Text style={styles.sessionText}>Device: {deviceId.substring(0, 8)}...</Text>
+          <Text style={styles.sessionText}>Video Chunks: {chunkCount}</Text>
+          <Text style={styles.sessionText}>Status: {connectionStatus}</Text>
+          {deviceInfo && (
+            <>
+              <Text style={styles.sessionText}>Camera: {deviceInfo.name}</Text>
+              <Text style={styles.sessionText}>Position: {deviceInfo.position}</Text>
+              <Text style={styles.sessionText}>
+                Features: {deviceInfo.hasFlash ? '📸' : ''}{deviceInfo.hasTorch ? '🔦' : ''}{deviceInfo.supportsFocus ? '🎯' : ''}
+              </Text>
+            </>
+          )}
+          {videoStreamActive && (
+            <Text style={styles.sessionText}>🔴 LIVE STREAMING</Text>
           )}
         </View>
-        
-        {/* Recording controls */}
-        <View style={styles.buttonContainer}>
-          {!isRecording ? (
-            <TouchableOpacity
-              style={[styles.button, styles.recordButton]}
-              onPress={handleStartRecording}
-            >
-              <Text style={styles.buttonText}>Record</Text>
-            </TouchableOpacity>
-          ) : (
-            <TouchableOpacity
-              style={[styles.button, styles.stopButton]}
-              onPress={handleStopRecording}
-            >
-              <Text style={styles.buttonText}>Stop</Text>
-            </TouchableOpacity>
-          )}
-          {!isRecording && (
-            <TouchableOpacity
-              style={[styles.button, styles.closeButton]}
-              onPress={handleCloseCamera}
-            >
-              <Text style={styles.buttonText}>Close</Text>
-            </TouchableOpacity>
-          )}
-        </View>
+
+        <TouchableOpacity
+          style={[styles.recordButton, isStreaming && styles.recordButtonActive]}
+          onPress={isStreaming ? stopStreaming : startStreaming}
+          disabled={connectionStatus === 'Connecting...' || connectionStatus === 'Starting Video Stream...'}
+        >
+          <Text style={styles.recordButtonText}>
+            {isStreaming ? 'STOP LIVE STREAM' : 
+             connectionStatus === 'Connecting...' ? 'CONNECTING...' : 
+             connectionStatus === 'Starting Video Stream...' ? 'STARTING...' : 
+             'START LIVE STREAM'}
+          </Text>
+        </TouchableOpacity>
       </View>
     </View>
   );
 }
 
 const styles = StyleSheet.create({
-  splashScreen: {
+  container: {
     flex: 1,
-    backgroundColor: '#111',
-    justifyContent: 'center',
-    alignItems: 'center',
+    backgroundColor: '#000',
   },
-  splashText: {
-    color: 'white',
-    fontSize: 38,
+  header: {
+    position: 'absolute',
+    top: 50,
+    left: 20,
+    zIndex: 10,
+  },
+  brandText: {
+    color: '#ff6b35',
+    fontSize: 28,
+    fontWeight: '900',
+    letterSpacing: 3,
+    textShadowColor: '#000',
+    textShadowOffset: { width: 2, height: 2 },
+    textShadowRadius: 4,
+  },
+  subtitle: {
+    color: '#fff',
+    fontSize: 12,
+    letterSpacing: 1,
+    marginTop: 2,
+  },
+  camera: {
+    flex: 1,
+  },
+  statusOverlay: {
+    position: 'absolute',
+    top: 50,
+    right: 20,
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: 'rgba(0,0,0,0.7)',
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    borderRadius: 20,
+  },
+  statusDot: {
+    width: 10,
+    height: 10,
+    borderRadius: 5,
+    marginRight: 8,
+  },
+  statusText: {
+    color: '#fff',
+    fontSize: 12,
     fontWeight: 'bold',
-    letterSpacing: 2,
   },
-  mainScreen: {
-    flex: 1,
-    justifyContent: 'center',
-    alignItems: 'center',
-    backgroundColor: 'black',
+  streamingStatusContainer: {
+    position: 'absolute',
+    top: 90,
+    left: 20,
+    backgroundColor: 'rgba(255,0,0,0.8)',
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    borderRadius: 15,
+    maxWidth: 250,
   },
-  title: {
-    color: 'white',
-    fontSize: 32,
+  streamingStatusText: {
+    color: '#ffffff',
+    fontSize: 11,
     fontWeight: 'bold',
-    marginBottom: 40,
   },
-  openButton: {
-    backgroundColor: 'red',
-    padding: 18,
-    borderRadius: 50,
-    minWidth: 180,
-    alignItems: 'center',
+  uploadStatusContainer: {
+    position: 'absolute',
+    top: 90,
+    right: 20,
+    backgroundColor: 'rgba(0,0,0,0.7)',
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    borderRadius: 15,
+    maxWidth: 200,
   },
-  container: { flex: 1, backgroundColor: 'black' },
-  loading: {
-    flex: 1,
-    justifyContent: 'center',
-    alignItems: 'center',
-    backgroundColor: 'black',
+  uploadStatusText: {
+    color: '#00ff00',
+    fontSize: 10,
+    fontWeight: 'bold',
+  },
+  analysisContainer: {
+    position: 'absolute',
+    top: 120,
+    left: 20,
+    right: 20,
+    backgroundColor: 'rgba(0,0,0,0.8)',
+    padding: 12,
+    borderRadius: 8,
+  },
+  analysisTitle: {
+    color: '#ff6b35',
+    fontSize: 14,
+    fontWeight: 'bold',
+    marginBottom: 4,
+  },
+  analysisText: {
+    color: '#fff',
+    fontSize: 12,
   },
   controls: {
     position: 'absolute',
-    bottom: 40,
-    alignSelf: 'center',
+    bottom: 50,
+    left: 20,
+    right: 20,
     alignItems: 'center',
   },
-  statusContainer: {
-    backgroundColor: 'rgba(0, 0, 0, 0.7)',
-    padding: 10,
-    borderRadius: 10,
+  sessionInfo: {
+    backgroundColor: 'rgba(0,0,0,0.7)',
+    padding: 8,
+    borderRadius: 8,
     marginBottom: 20,
     alignItems: 'center',
   },
-  statusText: {
-    color: 'white',
-    fontSize: 14,
-    fontWeight: 'bold',
-  },
   sessionText: {
     color: '#ccc',
-    fontSize: 12,
-    marginTop: 4,
-  },
-  buttonContainer: {
-    flexDirection: 'row',
-    gap: 20,
-  },
-  button: {
-    backgroundColor: 'red',
-    padding: 18,
-    borderRadius: 50,
-    marginHorizontal: 10,
-    minWidth: 100,
-    alignItems: 'center',
+    fontSize: 10,
   },
   recordButton: {
-    backgroundColor: 'red',
+    backgroundColor: '#ff6b35',
+    paddingVertical: 15,
+    paddingHorizontal: 40,
+    borderRadius: 30,
+    elevation: 5,
   },
-  stopButton: {
-    backgroundColor: 'gray',
+  recordButtonActive: {
+    backgroundColor: '#ff3333',
   },
-  closeButton: {
-    backgroundColor: '#333',
+  recordButtonText: {
+    color: '#fff',
+    fontSize: 16,
+    fontWeight: 'bold',
+    letterSpacing: 1,
+  },
+  permissionContainer: {
+    flex: 1,
+    justifyContent: 'center',
+    alignItems: 'center',
+    backgroundColor: '#000',
+    padding: 20,
+  },
+  permissionText: {
+    color: '#fff',
+    fontSize: 16,
+    marginBottom: 30,
+    textAlign: 'center',
+    lineHeight: 24,
+  },
+  buttonContainer: {
+    flexDirection: 'column',
+    gap: 15,
+  },
+  button: {
+    backgroundColor: '#ff6b35',
+    paddingVertical: 12,
+    paddingHorizontal: 24,
+    borderRadius: 8,
+    minWidth: 200,
+    alignItems: 'center',
+    marginTop: 20,
+  },
+  secondaryButton: {
+    backgroundColor: '#666',
   },
   buttonText: {
-    color: 'white',
-    fontSize: 18,
+    color: '#fff',
+    fontSize: 16,
     fontWeight: 'bold',
+  },
+  loadingContainer: {
+    flex: 1,
+    justifyContent: 'center',
+    alignItems: 'center',
+    backgroundColor: '#000',
+  },
+  loadingText: {
+    color: '#ff6b35',
+    fontSize: 20,
+    fontWeight: 'bold',
+    marginTop: 20,
+    textAlign: 'center',
+  },
+  errorContainer: {
+    flex: 1,
+    justifyContent: 'center',
+    alignItems: 'center',
+    backgroundColor: '#000',
+    padding: 20,
+  },
+  errorTitle: {
+    color: '#ff0000',
+    fontSize: 24,
+    fontWeight: 'bold',
+    marginBottom: 20,
+    marginTop: 20,
+  },
+  errorText: {
+    color: '#fff',
+    fontSize: 16,
+    textAlign: 'center',
+    marginBottom: 30,
+    lineHeight: 24,
   },
 });

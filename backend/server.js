@@ -1,614 +1,1639 @@
-const express = require('express');
-const multer = require('multer');
-const cors = require('cors');
-const fs = require('fs-extra');
-const path = require('path');
-const cron = require('node-cron');
-const { Storage } = require('@google-cloud/storage');
-const { v4: uuidv4 } = require('uuid');
+// require('dotenv').config();
+// const express = require('express');
+// const http = require('http');
+// const socketIo = require('socket.io');
+// const multer = require('multer');
+// const path = require('path');
+// const fs = require('fs').promises;
+// const { Storage } = require('@google-cloud/storage');
+// const videoIntelligence = require('@google-cloud/video-intelligence').v1;
+// const cors = require('cors');
 
-const app = express();
-const PORT = process.env.PORT || 3001;
+// const app = express();
+// const server = http.createServer(app);
+// const io = socketIo(server, {
+//   cors: {
+//     origin: "*",
+//     methods: ["GET", "POST"],
+//     credentials: true
+//   },
+//   maxHttpBufferSize: 1e8 // 100MB for video streams
+// });
 
-// Middleware
-app.use(cors());
-app.use(express.json());
+// // Configuration
+// const PORT = process.env.PORT || 3001;
+// const UPLOADS_DIR = path.join(__dirname, 'uploads');
+// const BUCKET_NAME = process.env.GCS_BUCKET_NAME || 'videouploader-heimdall';
+// const GCLOUD_KEYFILE = path.join(__dirname, process.env.GCLOUD_KEYFILE || 'heimdall-cam.json');
 
-// Create necessary directories
-const TEMP_DIR = path.join(__dirname, 'temp');
-const UPLOADS_DIR = path.join(__dirname, 'uploads');
+// // Ensure uploads directory exists
+// fs.mkdir(UPLOADS_DIR, { recursive: true }).catch(console.error);
 
-fs.ensureDirSync(TEMP_DIR);
-fs.ensureDirSync(UPLOADS_DIR);
+// // Initialize Google Cloud services
+// const storage = new Storage({
+//   keyFilename: GCLOUD_KEYFILE,
+//   projectId: process.env.GCLOUD_PROJECT_ID,
+// });
 
-// Initialize Google Cloud Storage
-const storage = new Storage({
-  keyFilename: path.join(__dirname, 'heimdall-cam.json'),
-  projectId: 'heimdall-cam'
-});
+// const videoClient = new videoIntelligence.VideoIntelligenceServiceClient({
+//   keyFilename: GCLOUD_KEYFILE,
+// });
 
-const bucketName = 'videouploader-heimdall';
-const bucket = storage.bucket(bucketName);
+// // Enhanced CORS for ngrok and streaming
+// // app.use(cors({
+// //   origin: "*",
+// //   methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+// //   allowedHeaders: ["Content-Type", "Authorization", "ngrok-skip-browser-warning"],
+// //   credentials: true
+// // }));
 
-// Configure multer for video uploads
-const upload = multer({
-  dest: TEMP_DIR,
-  limits: {
-    fileSize: 100 * 1024 * 1024, // 100MB limit
-    files: 2 // Allow video and metadata files
-  },
-  fileFilter: (req, file, cb) => {
-    // Accept video files and metadata JSON
-    if (file.mimetype.startsWith('video/') || file.fieldname === 'metadata') {
-      cb(null, true);
-    } else {
-      cb(new Error('Only video and metadata files are allowed!'), false);
-    }
-  }
-});
-
-// Configure multer to handle multiple file uploads
-const uploadMultiple = upload.fields([
-  { name: 'video', maxCount: 1 },
-  { name: 'metadata', maxCount: 1 }
-]);
-
-// Store current recording session
-let currentRecording = {
-  isRecording: false,
-  startTime: null,
-  chunks: [],
-  sessionId: null,
-  metadata: null
-};
-
-// API Routes
-
-// Health check
-app.get('/health', (req, res) => {
-  res.json({ 
-    status: 'OK', 
-    timestamp: new Date().toISOString(),
-    recording: currentRecording.isRecording 
-  });
-});
-
-// Start recording session
-app.post('/start-recording', (req, res) => {
-  try {
-    if (currentRecording.isRecording) {
-      console.warn('Warning: A recording was already in progress. Force-stopping to start a new one.');
-      // Immediately reset the state before proceeding
-      currentRecording = {
-        isRecording: false,
-        startTime: null,
-        chunks: [],
-        sessionId: null,
-        metadata: null
-      };
-    }
-
-    // Extract metadata from request body
-    const { metadata } = req.body;
-    
-    currentRecording = {
-      isRecording: true,
-      startTime: new Date(),
-      chunks: [],
-      sessionId: uuidv4(),
-      metadata: metadata || null
-    };
-
-    console.log(`Recording started - Session ID: ${currentRecording.sessionId}`);
-    if (currentRecording.metadata) {
-      console.log('Recording metadata:', JSON.stringify(currentRecording.metadata, null, 2));
-    }
-    
-    res.json({ 
-      message: 'Recording started successfully',
-      sessionId: currentRecording.sessionId,
-      startTime: currentRecording.startTime,
-      metadata: currentRecording.metadata
-    });
-  } catch (error) {
-    console.error('Error starting recording:', error);
-    res.status(500).json({ error: 'Failed to start recording' });
-  }
-});
-
-// Stop recording session
-app.post('/stop-recording', async (req, res) => {
-  try {
-    if (!currentRecording.isRecording) {
-      return res.status(400).json({ error: 'No active recording session' });
-    }
-
-    const endTime = new Date();
-    const duration = endTime - currentRecording.startTime;
-    const stoppedSessionId = currentRecording.sessionId;
-
-    console.log(`Recording stopped - Session ID: ${stoppedSessionId}, Duration: ${duration}ms`);
-
-    // Mark as not recording and process any remaining chunks
-    currentRecording.isRecording = false;
-    await processVideoChunks();
-
-    // Reset recording state completely
-    currentRecording = {
-      isRecording: false,
-      startTime: null,
-      chunks: [],
-      sessionId: null
-    };
-
-    res.json({ 
-      message: 'Recording stopped successfully',
-      sessionId: stoppedSessionId,
-      duration: duration,
-    });
-
-  } catch (error) {
-    console.error('Error stopping recording:', error);
-    res.status(500).json({ error: 'Failed to stop recording' });
-  }
-});
-
-// Upload video chunk with metadata
-app.post('/upload-chunk', uploadMultiple, async (req, res) => {
-  let videoFile = null;
-  let metadata = null;
-
-  try {
-    // Check if we have a video file
-    if (!req.files || !req.files.video || req.files.video.length === 0) {
-      return res.status(400).json({ error: 'No video file provided' });
-    }
-    videoFile = req.files.video[0];
-
-    // Check for metadata file
-    if (req.files.metadata && req.files.metadata.length > 0) {
-      try {
-        const metadataPath = req.files.metadata[0].path;
-        const metadataContent = await fs.readFile(metadataPath, 'utf-8');
-        metadata = JSON.parse(metadataContent);
-        
-        // Clean up the temporary metadata file
-        await fs.remove(metadataPath);
-        
-        // Update the current recording metadata if this is the first chunk
-        if (currentRecording.chunks.length === 0 && !currentRecording.metadata) {
-          currentRecording.metadata = metadata;
-          console.log('Updated recording metadata from first chunk:', 
-            JSON.stringify(metadata, null, 2));
-        }
-      } catch (error) {
-        console.error('Error processing metadata:', error);
-        // Don't fail the upload if metadata processing fails
-      }
-    }
-
-    if (!currentRecording.isRecording) {
-      // Clean up uploaded files if no active recording
-      await Promise.all([
-        videoFile && fs.remove(videoFile.path).catch(console.error),
-        req.files.metadata && req.files.metadata[0] && 
-          fs.remove(req.files.metadata[0].path).catch(console.error)
-      ]);
-      return res.status(400).json({ error: 'No active recording session' });
-    }
-
-    // Move the uploaded chunk from TEMP_DIR to UPLOADS_DIR for persistence
-    const uniqueName = `${currentRecording.sessionId || 'unknown'}_${Date.now()}_${videoFile.originalname}`;
-    const destPath = path.join(UPLOADS_DIR, uniqueName);
-    await fs.move(videoFile.path, destPath, { overwrite: true });
-
-    const chunkInfo = {
-      filename: uniqueName,
-      originalName: videoFile.originalname,
-      path: destPath,
-      size: videoFile.size,
-      timestamp: new Date(),
-      chunkIndex: currentRecording.chunks.length,
-      metadata: metadata || undefined
-    };
-
-    currentRecording.chunks.push(chunkInfo);
-
-    console.log(`Chunk uploaded - Session: ${currentRecording.sessionId}, ` +
-      `Chunk: ${chunkInfo.chunkIndex}, Size: ${(videoFile.size / (1024 * 1024)).toFixed(2)}MB`);
-    if (metadata) {
-      console.log(`Chunk ${chunkInfo.chunkIndex} metadata:`, 
-        JSON.stringify(metadata, null, 2));
-    }
-
-    res.json({
-      message: 'Video chunk uploaded successfully',
-      chunkIndex: chunkInfo.chunkIndex,
-      sessionId: currentRecording.sessionId,
-      metadataReceived: !!metadata
-    });
-  } catch (error) {
-    console.error('Error uploading chunk:', error);
-    
-    // Clean up any uploaded files in case of error
-    try {
-      await Promise.all([
-        videoFile && fs.remove(videoFile.path).catch(console.error),
-        req.files?.metadata?.[0]?.path && 
-          fs.remove(req.files.metadata[0].path).catch(console.error)
-      ]);
-    } catch (cleanupError) {
-      console.error('Error during cleanup:', cleanupError);
-    }
-    
-    res.status(500).json({ 
-      error: 'Failed to upload video chunk',
-      details: error.message 
-    });
-  }
-});
-
-// Get recording status
-app.get('/recording-status', (req, res) => {
-  res.json({
-    isRecording: currentRecording.isRecording,
-    sessionId: currentRecording.sessionId,
-    startTime: currentRecording.startTime,
-    chunksCount: currentRecording.chunks.length,
-    duration: currentRecording.startTime ? new Date() - currentRecording.startTime : 0
-  });
-});
-
-/**
- * Uploads a file to Google Cloud Storage with optional metadata
- * @param {string} filePath - Path to the local file to upload
- * @param {string} fileName - Destination filename in the bucket
- * @param {Object} [metadata={}] - Additional metadata to include with the file
- * @returns {Promise<string>} The destination path in the bucket
- */
-async function uploadToGCP(filePath, fileName, metadata = {}) {
-  try {
-    // Ensure the filename is URL-safe
-    const safeFileName = fileName.replace(/[^a-zA-Z0-9-_.]/g, '_');
-    const destination = `videos/${new Date().toISOString().split('T')[0]}/${safeFileName}`;
-    
-    // Prepare metadata with defaults
-    const fileMetadata = {
-      metadata: {
-        uploadedAt: new Date().toISOString(),
-        source: 'heimdall-cam',
-        ...metadata // Spread the provided metadata
-      }
-    };
-
-    console.log(`Uploading ${filePath} to GCP bucket ${bucketName}/${destination}`);
-    console.log('With metadata:', JSON.stringify(fileMetadata, null, 2));
-    
-    // Upload the file
-    await bucket.upload(filePath, {
-      destination: destination,
-      metadata: fileMetadata,
-      // Enable resumable uploads for large files
-      resumable: true,
-      // Set content type based on file extension
-      contentType: filePath.endsWith('.mp4') ? 'video/mp4' : 
-                  filePath.endsWith('.mov') ? 'video/quicktime' :
-                  'application/octet-stream'
-    });
-
-    console.log(`Successfully uploaded ${fileName} to GCP bucket: ${bucketName}/${destination}`);
-    return destination;
-  } catch (error) {
-    console.error('Error uploading to GCP:', error);
-    // Enhance error with more context
-    const enhancedError = new Error(`Failed to upload ${fileName} to GCP: ${error.message}`);
-    enhancedError.originalError = error;
-    enhancedError.filePath = filePath;
-    enhancedError.fileName = fileName;
-    enhancedError.metadata = metadata;
-    throw enhancedError;
-  }
-}
-
-// Function to process and upload video chunks
-// async function processVideoChunks() {
-//   try {
-//     // if (!currentRecording.isRecording || currentRecording.chunks.length === 0) {
-//     //   return;
-//     // }
-
-//     if (currentRecording.chunks.length === 0) {
-//         return;
-//     }
+// // // Add ngrok compatibility middleware
+// // app.use((req, res, next) => {
+// //   res.header('Access-Control-Allow-Origin', '*');
+// //   res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+// //   res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization, ngrok-skip-browser-warning');
   
-//     console.log(`Processing ${currentRecording.chunks.length} video chunks...`);
+// //   if (req.headers['ngrok-skip-browser-warning']) {
+// //     res.header('ngrok-skip-browser-warning', 'true');
+// //   }
+  
+// //   next();
+// // });
 
-//     // Process each chunk
-//     for (const chunk of currentRecording.chunks) {
-//       try {
-//         const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-//         const fileName = `heimdall-cam-${currentRecording.sessionId}-chunk-${chunk.chunkIndex}-${timestamp}.${chunk.originalName.split('.').pop()}`;
-        
-//         // Upload to GCP
-//         await uploadToGCP(chunk.path, fileName);
-        
-//         // Clean up local file after successful upload
-//         await fs.remove(chunk.path);
-        
-//         console.log(`Chunk ${chunk.chunkIndex} processed and uploaded successfully`);
-//       } catch (error) {
-//         console.error(`Error processing chunk ${chunk.chunkIndex}:`, error);
+
+// // Enhanced CORS configuration
+// const corsOptions = {
+//   origin: function (origin, callback) {
+//     // Allow requests with no origin (mobile apps, etc.)
+//     if (!origin) return callback(null, true);
+    
+//     // Allow all origins for development
+//     if (process.env.NODE_ENV === 'development') {
+//       return callback(null, true);
+//     }
+    
+//     // Add your specific origins here for production
+//     const allowedOrigins = ['http://localhost:3000', 'https://51b3a9002a7b.ngrok-free.app', 'https://67a845f00deb.ngrok-free.app', 'htt://localhost:3001', 'react-native-app'];
+//     if (allowedOrigins.includes(origin)) {
+//       return callback(null, true);
+//     }
+    
+//     return callback(null, true); // Allow all for now
+//   },
+//   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+//   allowedHeaders: ['Content-Type', 'Authorization', 'ngrok-skip-browser-warning', 'Origin', 'Accept'],
+//   credentials: true,
+//   maxAge: 86400 // 24 hours
+// };
+
+// app.use(cors(corsOptions));
+
+// // Additional middleware for ngrok compatibility
+// app.use((req, res, next) => {
+//   res.header('Access-Control-Allow-Origin', '*');
+//   res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+//   res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization, ngrok-skip-browser-warning');
+//   res.header('Access-Control-Max-Age', '86400');
+  
+//   // Handle preflight OPTIONS requests
+//   if (req.method === 'OPTIONS') {
+//     return res.status(200).end();
+//   }
+  
+//   next();
+// });
+
+
+// app.use(express.json());
+// app.use('/uploads', express.static(UPLOADS_DIR));
+// app.use(express.static(path.join(__dirname, 'public')));
+
+// // Multer configuration for file uploads
+// const upload = multer({
+//   dest: UPLOADS_DIR,
+//   limits: {
+//     fileSize: 100 * 1024 * 1024, // 100MB limit
+//   },
+//   fileFilter: (req, file, cb) => {
+//     if (file.mimetype.startsWith('video/')) {
+//       cb(null, true);
+//     } else {
+//       cb(new Error('Only video files are allowed'));
+//     }
+//   },
+// });
+
+// // Active streaming sessions with enhanced data
+// const activeStreams = new Map();
+// const deviceSessions = new Map();
+// const streamRooms = new Map(); // For video streaming rooms
+
+// // Socket.IO connection handling with video streaming
+// // Enhanced Socket.IO connection handling
+// io.on('connection', (socket) => {
+//   console.log(`📱 Client connected: ${socket.id}`);
+
+//   socket.on('register-device', (data) => {
+//     const { deviceId, sessionId } = data;
+    
+//     socket.deviceId = deviceId;
+//     socket.sessionId = sessionId;
+//     socket.join(`device-${deviceId}`);
+    
+//     deviceSessions.set(deviceId, {
+//       socketId: socket.id,
+//       sessionId,
+//       startTime: new Date(),
+//       chunkCount: 0,
+//       isStreaming: false,
+//       lastFrameTime: null,
+//     });
+
+//     console.log(`✅ Device registered: ${deviceId}`);
+//     socket.emit('device-registered', { deviceId, sessionId });
+//   });
+
+//   // Enhanced dashboard registration
+//   socket.on('register-dashboard', () => {
+//     socket.join('dashboard');
+//     console.log(`📊 Dashboard client registered: ${socket.id}`);
+    
+//     // Send current active streams
+//     const streams = Array.from(activeStreams.entries()).map(([deviceId, stream]) => ({
+//       deviceId,
+//       sessionId: stream.sessionId,
+//       startTime: stream.startTime,
+//       isActive: stream.isActive,
+//       lastFrame: stream.lastFrame || null,
+//       frameCount: stream.frameCount || 0,
+//     }));
+    
+//     socket.emit('current-streams', { streams });
+//   });
+
+//   socket.on('start-stream', (data) => {
+//     const { deviceId, sessionId } = data;
+    
+//     activeStreams.set(deviceId, {
+//       socketId: socket.id,
+//       sessionId,
+//       isActive: true,
+//       startTime: new Date(),
+//       lastFrame: null,
+//       frameCount: 0,
+//       lastFrameTime: null,
+//     });
+
+//     console.log(`🎬 Stream started for device: ${deviceId}`);
+    
+//     // Broadcast to dashboard
+//     io.to('dashboard').emit('stream-started', { 
+//       deviceId, 
+//       sessionId,
+//       startTime: new Date(),
+//     });
+//   });
+
+//   // Enhanced video frame handling
+//   socket.on('video-frame', (data) => {
+//     const { deviceId, frame, timestamp, frameNumber } = data;
+    
+//     if (activeStreams.has(deviceId)) {
+//       const stream = activeStreams.get(deviceId);
+//       stream.lastFrame = frame;
+//       stream.frameCount = frameNumber;
+//       stream.lastFrameTime = new Date();
+//       activeStreams.set(deviceId, stream);
+      
+//       console.log(`📹 Frame ${frameNumber} received from device ${deviceId}`);
+      
+//       // Broadcast frame to all dashboard clients
+//       io.to('dashboard').emit('video-frame', {
+//         deviceId,
+//         frame,
+//         timestamp,
+//         frameNumber,
+//         receivedAt: new Date().toISOString(),
+//       });
+      
+//       console.log(`📡 Frame ${frameNumber} broadcasted to dashboard`);
+//     }
+//   });
+
+//   // Enhanced chunk upload handling with immediate analysis
+//   socket.on('chunk-uploaded', async (data) => {
+//     const { chunkId, sessionId, deviceId } = data;
+    
+//     if (deviceSessions.has(deviceId)) {
+//       const session = deviceSessions.get(deviceId);
+//       session.chunkCount++;
+//       deviceSessions.set(deviceId, session);
+//     }
+
+//     console.log(`📥 Processing chunk: ${chunkId}`);
+    
+//     // Send immediate acknowledgment
+//     socket.emit('chunk-processing', { chunkId, status: 'processing' });
+//     io.to('dashboard').emit('chunk-processing', { deviceId, chunkId, status: 'processing' });
+    
+//     // Start analysis
+//     try {
+//       await processVideoChunk(chunkId, sessionId, deviceId, socket);
+//     } catch (error) {
+//       console.error(`❌ Analysis failed for ${chunkId}:`, error);
+//       socket.emit('analysis-error', { chunkId, error: error.message });
+//       io.to('dashboard').emit('analysis-error', { deviceId, chunkId, error: error.message });
+//     }
+//   });
+
+//   socket.on('stop-stream', (data) => {
+//     const { deviceId } = data;
+    
+//     if (activeStreams.has(deviceId)) {
+//       activeStreams.delete(deviceId);
+//     }
+    
+//     console.log(`🛑 Stream stopped for device: ${deviceId}`);
+//     io.to('dashboard').emit('stream-stopped', { deviceId });
+//   });
+
+//   socket.on('disconnect', () => {
+//     console.log(`📱 Client disconnected: ${socket.id}`);
+    
+//     for (const [deviceId, session] of deviceSessions.entries()) {
+//       if (session.socketId === socket.id) {
+//         deviceSessions.delete(deviceId);
+//         activeStreams.delete(deviceId);
+//         io.to('dashboard').emit('stream-stopped', { deviceId });
+//         break;
 //       }
 //     }
+//   });
+// });
 
-//     // Clear processed chunks
-//     currentRecording.chunks = [];
+// // Enhanced video analysis processing
+// async function processVideoChunk(chunkId, sessionId, deviceId, socket) {
+//   try {
+//     const gcsUri = `gs://${BUCKET_NAME}/streams/${deviceId}/${sessionId}/${chunkId}.mp4`;
     
+//     console.log(`🤖 Starting AI analysis for: ${gcsUri}`);
+
+//     // Send processing status update
+//     const processingStatus = {
+//       chunkId,
+//       sessionId,
+//       deviceId,
+//       status: 'analyzing',
+//       timestamp: new Date(),
+//     };
+    
+//     socket.emit('analysis-status', processingStatus);
+//     io.to('dashboard').emit('analysis-status', processingStatus);
+
+//     const request = {
+//       inputUri: gcsUri,
+//       features: [
+//         'LABEL_DETECTION',
+//         'PERSON_DETECTION',
+//         'OBJECT_TRACKING',
+//         'TEXT_DETECTION',
+//       ],
+//       videoContext: {
+//         personDetectionConfig: {
+//           includeBoundingBoxes: true,
+//           includeAttributes: true,
+//         },
+//         labelDetectionConfig: {
+//           model: 'builtin/latest',
+//         },
+//       },
+//     };
+
+//     const [operation] = await videoClient.annotateVideo(request);
+//     console.log(`⏳ Analysis operation started for ${chunkId}`);
+    
+//     const [result] = await operation.promise();
+//     console.log(`✅ Analysis completed for ${chunkId}`);
+    
+//     const analysis = result.annotationResults[0];
+//     const processedAnalysis = processAnalysisResults(analysis);
+    
+//     // Save analysis results
+//     const analysisPath = path.join(UPLOADS_DIR, deviceId, sessionId, `${chunkId}-analysis.json`);
+//     await fs.writeFile(analysisPath, JSON.stringify(processedAnalysis, null, 2));
+
+//     // Send results to mobile app and dashboard
+//     const analysisData = {
+//       chunkId,
+//       sessionId,
+//       deviceId,
+//       timestamp: new Date(),
+//       status: 'completed',
+//       ...processedAnalysis,
+//     };
+
+//     socket.emit('analysis-result', analysisData);
+//     io.to('dashboard').emit('analysis-result', analysisData);
+    
+//     console.log(`📊 Analysis results sent for ${chunkId}`);
+
+//     // Handle security alerts
+//     if (processedAnalysis.alerts && processedAnalysis.alerts.length > 0) {
+//       const alertData = {
+//         deviceId,
+//         sessionId,
+//         chunkId,
+//         alerts: processedAnalysis.alerts,
+//         timestamp: new Date(),
+//       };
+      
+//       io.emit('security-alert', alertData);
+//       console.log(`🚨 Security alert sent for ${chunkId}`);
+//     }
+
 //   } catch (error) {
-//     console.error('Error in processVideoChunks:', error);
+//     console.error(`❌ Analysis error for chunk ${chunkId}:`, error);
+    
+//     const errorData = {
+//       chunkId,
+//       sessionId,
+//       deviceId,
+//       status: 'error',
+//       error: error.message,
+//       timestamp: new Date(),
+//     };
+    
+//     socket.emit('analysis-error', errorData);
+//     io.to('dashboard').emit('analysis-error', errorData);
 //   }
 // }
 
+// // Enhanced analysis results processing
+// function processAnalysisResults(analysis) {
+//   const processed = {
+//     labels: [],
+//     personDetection: {
+//       detectedPersons: [],
+//       totalCount: 0,
+//     },
+//     objectTracking: [],
+//     crowdAnalysis: {
+//       density: 'low',
+//       riskLevel: 'normal',
+//     },
+//     alerts: [],
+//     summary: '',
+//   };
 
-/**
- * Processes video chunks from the uploads directory and uploads them to GCP
- * Also processes any pending chunks in memory
- */
-async function processVideoChunks() {
-  try {
-    // Process in-memory chunks first
-    if (currentRecording.chunks && currentRecording.chunks.length > 0) {
-      console.log(`[${new Date().toISOString()}] Processing ${currentRecording.chunks.length} in-memory video chunks...`);
-      
-      // Create a copy of the chunks array to avoid modification during iteration
-      const chunksToProcess = [...currentRecording.chunks];
-      let processedCount = 0;
-      let errorCount = 0;
-      
-      for (const chunk of chunksToProcess) {
-        try {
-          if (!chunk.processed && chunk.path) {
-            const fileExists = await fs.pathExists(chunk.path);
-            if (!fileExists) {
-              console.warn(`[${new Date().toISOString()}] Chunk file not found: ${chunk.path}`);
-              chunk.processed = true; // Mark as processed to avoid retrying
-              errorCount++;
-              continue;
-            }
-            
-            const fileStats = await fs.stat(chunk.path);
-            if (fileStats.size === 0) {
-              console.warn(`[${new Date().toISOString()}] Chunk file is empty: ${chunk.path}`);
-              chunk.processed = true; // Mark as processed to avoid retrying
-              errorCount++;
-              await fs.remove(chunk.path); // Clean up empty file
-              continue;
-            }
-            
-            const timestamp = chunk.timestamp || new Date();
-            const chunkIndex = chunk.chunkIndex || 'unknown';
-            const sessionId = currentRecording.sessionId || 'unknown';
-            
-            const fileName = `sessions/${sessionId}/` +
-              `${new Date(timestamp).toISOString().replace(/[:.]/g, '-')}_` +
-              `${chunkIndex}${chunk.filename ? path.extname(chunk.filename) : '.mp4'}`;
-            
-            // Add metadata to GCP metadata
-            const metadata = {
-              uploadedAt: new Date().toISOString(),
-              source: 'heimdall-cam',
-              sessionId: sessionId,
-              chunkIndex: chunkIndex,
-              timestamp: timestamp.toISOString(),
-              ...(chunk.metadata ? { 
-                deviceInfo: chunk.metadata.deviceInfo,
-                cameraInfo: chunk.metadata.cameraInfo,
-                viewport: chunk.metadata.viewport,
-                orientation: chunk.metadata.orientation,
-                recordingSettings: chunk.metadata.recordingSettings,
-                location: chunk.metadata.location,
-                gyro: chunk.metadata.gyro
-              } : {})
-            };
-            
-            console.log(`[${new Date().toISOString()}] Uploading chunk ${chunkIndex} (${(fileStats.size / (1024 * 1024)).toFixed(2)} MB) to GCP`);
-            
-            await uploadToGCP(chunk.path, fileName, metadata);
-            
-            // Mark as processed and clean up
-            chunk.processed = true;
-            await fs.remove(chunk.path);
-            console.log(`[${new Date().toISOString()}] Successfully processed and uploaded chunk ${chunkIndex}`);
-            processedCount++;
-          }
-        } catch (error) {
-          errorCount++;
-          console.error(`[${new Date().toISOString()}] Error processing in-memory chunk ${chunk.chunkIndex || 'unknown'}:`, error);
-          
-          // If we've failed multiple times, move to error directory
-          chunk.retryCount = (chunk.retryCount || 0) + 1;
-          if (chunk.retryCount > 3) {
-            console.error(`[${new Date().toISOString()}] Max retries exceeded for chunk ${chunk.chunkIndex || 'unknown'}, moving to error directory`);
-            chunk.processed = true; // Don't retry again
-            
-            try {
-              const errorDir = path.join(UPLOADS_DIR, 'error');
-              await fs.ensureDir(errorDir);
-              const errorPath = path.join(errorDir, path.basename(chunk.path));
-              await fs.move(chunk.path, errorPath, { overwrite: true });
-              console.error(`[${new Date().toISOString()}] Moved failed chunk to: ${errorPath}`);
-            } catch (moveError) {
-              console.error(`[${new Date().toISOString()}] Failed to move failed chunk:`, moveError);
-            }
-          }
-        }
-      }
-      
-      // Log processing summary
-      console.log(`[${new Date().toISOString()}] Processed ${processedCount} chunks with ${errorCount} errors`);
-      
-      // Remove processed chunks from memory
-      const beforeCount = currentRecording.chunks.length;
-      currentRecording.chunks = currentRecording.chunks.filter(chunk => !chunk.processed);
-      const removedCount = beforeCount - currentRecording.chunks.length;
-      
-      if (removedCount > 0) {
-        console.log(`[${new Date().toISOString()}] Removed ${removedCount} processed chunks from memory`);
-      }
-    }
+//   // Process labels
+//   if (analysis.labelAnnotations && analysis.labelAnnotations.length > 0) {
+//     processed.labels = analysis.labelAnnotations
+//       .filter(label => label.entity.description && label.frames.length > 0)
+//       .map(label => ({
+//         description: label.entity.description,
+//         confidence: label.frames[0].confidence || 0,
+//         category: label.categoryEntities?.[0]?.description || 'general',
+//       }))
+//       .sort((a, b) => b.confidence - a.confidence)
+//       .slice(0, 10);
+//   }
 
-    // Process any remaining files in the uploads directory
-    let uploadProcessed = 0;
-    let uploadErrors = 0;
+//   // Process person detection
+//   if (analysis.personDetectionAnnotations && analysis.personDetectionAnnotations.length > 0) {
+//     const personAnnotations = analysis.personDetectionAnnotations;
+//     processed.personDetection.detectedPersons = personAnnotations.map(person => ({
+//       trackId: person.trackId,
+//       confidence: person.confidence,
+//       attributes: person.attributes || [],
+//     }));
+//     processed.personDetection.totalCount = personAnnotations.length;
+
+//     // Crowd analysis
+//     const personCount = personAnnotations.length;
+//     if (personCount > 20) {
+//       processed.crowdAnalysis.density = 'high';
+//       processed.crowdAnalysis.riskLevel = 'elevated';
+//       processed.alerts.push({
+//         type: 'crowd_density',
+//         message: `High crowd density detected: ${personCount} people`,
+//         severity: 'warning',
+//       });
+//     } else if (personCount > 10) {
+//       processed.crowdAnalysis.density = 'medium';
+//     }
+//   }
+
+//   // Process object tracking
+//   if (analysis.objectAnnotations && analysis.objectAnnotations.length > 0) {
+//     processed.objectTracking = analysis.objectAnnotations
+//       .filter(obj => obj.entity.description)
+//       .map(obj => ({
+//         description: obj.entity.description,
+//         confidence: obj.confidence,
+//         trackId: obj.trackId,
+//       }));
+//   }
+
+//   // Process text detection
+//   if (analysis.textAnnotations && analysis.textAnnotations.length > 0) {
+//     processed.textDetections = analysis.textAnnotations
+//       .map(text => ({
+//         text: text.text,
+//         confidence: text.confidence,
+//       }))
+//       .slice(0, 5);
+//   }
+
+//   // Generate summary
+//   const summaryParts = [];
+//   if (processed.labels.length > 0) {
+//     summaryParts.push(`Objects: ${processed.labels.slice(0, 3).map(l => l.description).join(', ')}`);
+//   }
+//   if (processed.personDetection.totalCount > 0) {
+//     summaryParts.push(`People: ${processed.personDetection.totalCount}`);
+//   }
+//   if (processed.textDetections.length > 0) {
+//     summaryParts.push(`Text detected: ${processed.textDetections.length} items`);
+//   }
+  
+//   processed.summary = summaryParts.join(' | ') || 'No significant content detected';
+
+//   // Safety alerts
+//   const dangerousObjects = ['weapon', 'knife', 'gun', 'fire', 'smoke'];
+//   const detectedDangerous = processed.labels.filter(label => 
+//     dangerousObjects.some(dangerous => 
+//       label.description.toLowerCase().includes(dangerous)
+//     )
+//   );
+
+//   if (detectedDangerous.length > 0) {
+//     processed.alerts.push({
+//       type: 'dangerous_object',
+//       message: `Potential dangerous objects: ${detectedDangerous.map(d => d.description).join(', ')}`,
+//       severity: 'critical',
+//     });
+//   }
+
+//   return processed;
+// }
+
+// // Enhanced upload chunk endpoint with better error handling
+// // app.post('/upload-chunk', upload.single('video'), async (req, res) => {
+// //   try {
+// //     console.log('📥 Received upload request:', {
+// //       body: req.body,
+// //       file: req.file ? {
+// //         filename: req.file.filename,
+// //         originalname: req.file.originalname,
+// //         size: req.file.size,
+// //         mimetype: req.file.mimetype
+// //       } : null
+// //     });
+
+// //     const { sessionId, deviceId, chunkId } = req.body;
+// //     const videoFile = req.file;
+
+// //     // Validate required fields
+// //     if (!sessionId || !deviceId || !chunkId) {
+// //       return res.status(400).json({ 
+// //         error: 'Missing required fields: sessionId, deviceId, or chunkId',
+// //         received: { sessionId, deviceId, chunkId }
+// //       });
+// //     }
+
+// //     if (!videoFile) {
+// //       return res.status(400).json({ 
+// //         error: 'No video file provided',
+// //         contentType: req.headers['content-type']
+// //       });
+// //     }
+
+// //     // Validate file type and size
+// //     if (!videoFile.mimetype.startsWith('video/') && !videoFile.originalname.endsWith('.mov')) {
+// //       return res.status(400).json({ 
+// //         error: 'Invalid file type. Expected video file.',
+// //         received: videoFile.mimetype
+// //       });
+// //     }
+
+// //     if (videoFile.size === 0) {
+// //       return res.status(400).json({ 
+// //         error: 'Empty video file',
+// //         size: videoFile.size
+// //       });
+// //     }
+
+// //     // Create organized file structure
+// //     const sessionDir = path.join(UPLOADS_DIR, deviceId, sessionId);
+// //     await fs.mkdir(sessionDir, { recursive: true });
+
+// //     // Move and rename file
+// //     const fileName = `${chunkId}.mp4`;
+// //     const finalPath = path.join(sessionDir, fileName);
     
-    try {
-      const uploadFiles = (await fs.readdir(UPLOADS_DIR))
-        .filter(file => {
-          const ext = path.extname(file).toLowerCase();
-          return ['.mp4', '.mov', '.mkv', '.webm'].includes(ext);
-        });
-        
-      if (uploadFiles.length === 0) {
-        console.log(`[${new Date().toISOString()}] No pending video chunks to process in uploads directory.`);
-        return;
-      }
-      
-      console.log(`[${new Date().toISOString()}] Found ${uploadFiles.length} video chunks in uploads/ directory`);
-      
-      for (const file of uploadFiles) {
-        const filePath = path.join(UPLOADS_DIR, file);
-        
-        try {
-          // Check file exists and has content
-          const fileStats = await fs.stat(filePath);
-          if (fileStats.size === 0) {
-            console.warn(`[${new Date().toISOString()}] Skipping empty file: ${file}`);
-            await fs.remove(filePath);
-            continue;
-          }
-          
-          const fileExt = path.extname(file).toLowerCase();
-          const baseName = path.basename(file, fileExt);
-          const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-          const fileName = `sessions/unknown/${timestamp}_${baseName}${fileExt}`;
-          
-          console.log(`[${new Date().toISOString()}] Processing orphaned file: ${file} (${(fileStats.size / (1024 * 1024)).toFixed(2)} MB)`);
-          
-          const metadata = {
-            uploadedAt: new Date().toISOString(),
-            source: 'heimdall-cam',
-            sessionId: 'unknown',
-            originalFilename: file,
-            fileSize: fileStats.size,
-            detectedType: fileExt.replace('.', '')
-          };
-          
-          await uploadToGCP(filePath, fileName, metadata);
-          await fs.remove(filePath);
-          console.log(`[${new Date().toISOString()}] Successfully processed and uploaded ${file}`);
-          uploadProcessed++;
-          
-        } catch (error) {
-          uploadErrors++;
-          console.error(`[${new Date().toISOString()}] Error processing ${file}:`, error);
-          
-          // Move to error directory for manual inspection
-          try {
-            const errorDir = path.join(UPLOADS_DIR, 'error');
-            await fs.ensureDir(errorDir);
-            const errorPath = path.join(errorDir, `${Date.now()}_${path.basename(file)}`);
-            await fs.move(filePath, errorPath, { overwrite: true });
-            console.error(`[${new Date().toISOString()}] Moved failed file to error directory: ${errorPath}`);
-            
-            // Write error log
-            const errorLogPath = `${errorPath}.error.log`;
-            await fs.writeFile(errorLogPath, JSON.stringify({
-              timestamp: new Date().toISOString(),
-              error: error.toString(),
-              stack: error.stack,
-              metadata: {
-                originalPath: filePath,
-                size: fileStats?.size,
-                mtime: fileStats?.mtime
-              }
-            }, null, 2));
-            
-          } catch (moveError) {
-            console.error(`[${new Date().toISOString()}] Failed to move error file ${file}:`, moveError);
-          }
-        }
-      }
-      
-      // Log summary of uploads processing
-      if (uploadProcessed > 0 || uploadErrors > 0) {
-        console.log(`[${new Date().toISOString()}] Processed ${uploadProcessed} upload files with ${uploadErrors} errors`);
-      }
-      
-    } catch (error) {
-      console.error(`[${new Date().toISOString()}] Error processing uploads directory:`, error);
-    }
-  } catch (error) {
-    console.error('Error in processVideoChunks:', error);
-    // Don't rethrow to allow the server to continue running
-  }
-}
+// //     try {
+// //       await fs.rename(videoFile.path, finalPath);
+// //       console.log(`✅ File moved to: ${finalPath}`);
+// //     } catch (renameError) {
+// //       console.error('❌ File rename error:', renameError);
+// //       return res.status(500).json({ 
+// //         error: 'Failed to save uploaded file',
+// //         details: renameError.message
+// //       });
+// //     }
+
+// //     // Verify file exists and has content
+// //     try {
+// //       const stats = await fs.stat(finalPath);
+// //       if (stats.size === 0) {
+// //         throw new Error('Saved file is empty');
+// //       }
+// //       console.log(`✅ File verified: ${stats.size} bytes`);
+// //     } catch (statError) {
+// //       console.error('❌ File verification error:', statError);
+// //       return res.status(500).json({ 
+// //         error: 'File verification failed',
+// //         details: statError.message
+// //       });
+// //     }
+
+// //     // Upload to Google Cloud Storage
+// //     let gcsPath;
+// //     try {
+// //       gcsPath = `streams/${deviceId}/${sessionId}/${fileName}`;
+// //       await uploadToGCS(finalPath, gcsPath);
+// //       console.log(`✅ Uploaded to GCS: ${gcsPath}`);
+// //     } catch (gcsError) {
+// //       console.error('❌ GCS upload error:', gcsError);
+// //       // Don't fail the request if GCS upload fails, file is still saved locally
+// //       console.log('⚠️ Continuing without GCS upload...');
+// //     }
+
+// //     console.log(`✅ Chunk upload completed: ${fileName}`);
+    
+// //     res.json({
+// //       success: true,
+// //       chunkId,
+// //       gcsPath: gcsPath || null,
+// //       localPath: finalPath,
+// //       fileSize: videoFile.size,
+// //       timestamp: new Date(),
+// //     });
+
+// //   } catch (error) {
+// //     console.error('❌ Upload endpoint error:', error);
+// //     res.status(500).json({ 
+// //       error: 'Internal server error during upload',
+// //       details: error.message,
+// //       stack: process.env.NODE_ENV === 'development' ? error.stack : undefined
+// //     });
+// //   }
+// // });
 
 
-cron.schedule('*/10 * * * * *', async () => {
-  console.log('Running scheduled video processing...');
-  await processVideoChunks();
+// app.post('/upload-chunk', upload.single('video'), async (req, res) => {
+//   const startTime = new Date();
+//   console.log(`📥 Upload request received at ${startTime.toISOString()}`);
+//   console.log('📋 Request details:', {
+//     method: req.method,
+//     url: req.url,
+//     headers: {
+//       'content-type': req.headers['content-type'],
+//       'content-length': req.headers['content-length'],
+//       'user-agent': req.headers['user-agent'],
+//       'origin': req.headers['origin'],
+//     },
+//     body: req.body,
+//     fileInfo: req.file ? {
+//       fieldname: req.file.fieldname,
+//       originalname: req.file.originalname,
+//       encoding: req.file.encoding,
+//       mimetype: req.file.mimetype,
+//       size: req.file.size,
+//       destination: req.file.destination,
+//       filename: req.file.filename,
+//     } : 'No file received'
+//   });
+
+//   try {
+//     const { sessionId, deviceId, chunkId } = req.body;
+//     const videoFile = req.file;
+
+//     // Validate required fields
+//     if (!sessionId || !deviceId || !chunkId) {
+//       console.error('❌ Missing required fields:', { sessionId, deviceId, chunkId });
+//       return res.status(400).json({ 
+//         error: 'Missing required fields',
+//         required: ['sessionId', 'deviceId', 'chunkId'],
+//         received: { sessionId, deviceId, chunkId }
+//       });
+//     }
+
+//     if (!videoFile) {
+//       console.error('❌ No video file in request');
+//       return res.status(400).json({ 
+//         error: 'No video file provided',
+//         receivedFields: Object.keys(req.body),
+//         contentType: req.headers['content-type']
+//       });
+//     }
+
+//     console.log(`✅ Valid upload request for chunk: ${chunkId}`);
+
+//     // Create organized file structure
+//     const sessionDir = path.join(UPLOADS_DIR, deviceId, sessionId);
+//     await fs.mkdir(sessionDir, { recursive: true });
+
+//     // Move and rename file
+//     const fileName = `${chunkId}.mp4`;
+//     const finalPath = path.join(sessionDir, fileName);
+    
+//     await fs.rename(videoFile.path, finalPath);
+//     console.log(`✅ File saved to: ${finalPath}`);
+
+//     // Verify file
+//     const stats = await fs.stat(finalPath);
+//     console.log(`✅ File verified: ${stats.size} bytes`);
+
+//     // Upload to GCS (optional)
+//     let gcsPath = null;
+//     try {
+//       gcsPath = `streams/${deviceId}/${sessionId}/${fileName}`;
+//       await uploadToGCS(finalPath, gcsPath);
+//       console.log(`✅ Uploaded to GCS: ${gcsPath}`);
+//     } catch (gcsError) {
+//       console.error('⚠️ GCS upload failed:', gcsError.message);
+//       // Continue without GCS
+//     }
+
+//     const duration = new Date() - startTime;
+//     console.log(`✅ Upload completed in ${duration}ms`);
+    
+//     res.json({
+//       success: true,
+//       chunkId,
+//       gcsPath,
+//       localPath: finalPath,
+//       fileSize: stats.size,
+//       processingTime: duration,
+//       timestamp: new Date(),
+//     });
+
+//   } catch (error) {
+//     const duration = new Date() - startTime;
+//     console.error(`❌ Upload failed after ${duration}ms:`, error);
+//     res.status(500).json({ 
+//       error: 'Upload processing failed',
+//       details: error.message,
+//       processingTime: duration,
+//     });
+//   }
+// });
+
+
+
+// // Add to your server.js
+// app.get('/api/device-info/:deviceId', (req, res) => {
+//   const { deviceId } = req.params;
+//   const session = deviceSessions.get(deviceId);
+  
+//   if (!session) {
+//     return res.status(404).json({ error: 'Device not found' });
+//   }
+  
+//   // You can expand this with more device-specific information
+//   const deviceInfo = {
+//     deviceId,
+//     sessionId: session.sessionId,
+//     startTime: session.startTime,
+//     chunkCount: session.chunkCount,
+//     isStreaming: session.isStreaming,
+//     lastActivity: session.lastActivity || session.startTime,
+//     // Add camera info if available
+//     cameraInfo: session.cameraInfo || null,
+//   };
+  
+//   res.json(deviceInfo);
+// });
+
+
+
+// // Process video chunk with AI analysis
+// async function processVideoChunk(chunkId, sessionId, deviceId, socket) {
+//   try {
+//     const gcsUri = `gs://${BUCKET_NAME}/streams/${deviceId}/${sessionId}/${chunkId}.mp4`;
+    
+//     console.log(`Starting analysis for: ${gcsUri}`);
+
+//     const request = {
+//       inputUri: gcsUri,
+//       features: [
+//         'LABEL_DETECTION',
+//         'PERSON_DETECTION',
+//         'OBJECT_TRACKING',
+//         'TEXT_DETECTION',
+//         'SHOT_CHANGE_DETECTION',
+//       ],
+//       videoContext: {
+//         personDetectionConfig: {
+//           includeBoundingBoxes: true,
+//           includeAttributes: true,
+//           includePoseLandmarks: false,
+//         },
+//         objectTrackingConfig: {
+//           model: 'builtin/latest',
+//         },
+//       },
+//     };
+
+//     const [operation] = await videoClient.annotateVideo(request);
+//     const [result] = await operation.promise();
+//     const analysis = result.annotationResults[0];
+
+//     // Process and enhance analysis results
+//     const processedAnalysis = processAnalysisResults(analysis);
+    
+//     // Save analysis results
+//     const analysisPath = path.join(UPLOADS_DIR, deviceId, sessionId, `${chunkId}-analysis.json`);
+//     await fs.writeFile(analysisPath, JSON.stringify(processedAnalysis, null, 2));
+
+//     // Send real-time analysis to connected clients
+//     const analysisData = {
+//       chunkId,
+//       sessionId,
+//       deviceId,
+//       timestamp: new Date(),
+//       ...processedAnalysis,
+//     };
+
+//     socket.emit('analysis-result', analysisData);
+//     io.to('dashboard').emit('analysis-result', analysisData);
+
+//     // Broadcast to dashboard if critical alerts detected
+//     if (processedAnalysis.alerts && processedAnalysis.alerts.length > 0) {
+//       const alertData = {
+//         deviceId,
+//         sessionId,
+//         chunkId,
+//         alerts: processedAnalysis.alerts,
+//         timestamp: new Date(),
+//       };
+      
+//       io.emit('security-alert', alertData);
+//     }
+
+//     console.log(`Analysis completed for chunk: ${chunkId}`);
+
+//   } catch (error) {
+//     console.error(`Analysis error for chunk ${chunkId}:`, error);
+//     socket.emit('analysis-error', {
+//       chunkId,
+//       error: error.message,
+//     });
+//   }
+// }
+
+// // Process and enhance analysis results
+// function processAnalysisResults(analysis) {
+//   const processed = {
+//     labels: [],
+//     personDetection: {
+//       detectedPersons: [],
+//       totalCount: 0,
+//     },
+//     objectTracking: [],
+//     crowdAnalysis: {
+//       density: 'low',
+//       riskLevel: 'normal',
+//     },
+//     alerts: [],
+//   };
+
+//   // Process labels
+//   if (analysis.labelAnnotations) {
+//     processed.labels = analysis.labelAnnotations
+//       .filter(label => label.entity.description && label.frames.length > 0)
+//       .map(label => ({
+//         description: label.entity.description,
+//         confidence: label.frames[0].confidence || 0,
+//         category: label.categoryEntities?.[0]?.description || 'general',
+//       }))
+//       .sort((a, b) => b.confidence - a.confidence)
+//       .slice(0, 10);
+//   }
+
+//   // Process person detection
+//   if (analysis.personDetectionAnnotations) {
+//     const personAnnotations = analysis.personDetectionAnnotations;
+//     processed.personDetection.detectedPersons = personAnnotations.map(person => ({
+//       trackId: person.trackId,
+//       confidence: person.confidence,
+//       attributes: person.attributes || [],
+//     }));
+//     processed.personDetection.totalCount = personAnnotations.length;
+
+//     // Crowd analysis
+//     const personCount = personAnnotations.length;
+//     if (personCount > 50) {
+//       processed.crowdAnalysis.density = 'high';
+//       processed.crowdAnalysis.riskLevel = 'elevated';
+//       processed.alerts.push({
+//         type: 'crowd_density',
+//         message: `High crowd density detected: ${personCount} people`,
+//         severity: 'warning',
+//       });
+//     } else if (personCount > 20) {
+//       processed.crowdAnalysis.density = 'medium';
+//     }
+//   }
+
+//   // Process object tracking
+//   if (analysis.objectAnnotations) {
+//     processed.objectTracking = analysis.objectAnnotations
+//       .filter(obj => obj.entity.description)
+//       .map(obj => ({
+//         description: obj.entity.description,
+//         confidence: obj.confidence,
+//         trackId: obj.trackId,
+//       }));
+//   }
+
+//   // Safety alerts based on detected objects and scenarios
+//   const dangerousObjects = ['weapon', 'knife', 'gun', 'fire', 'smoke'];
+//   const detectedDangerous = processed.labels.filter(label => 
+//     dangerousObjects.some(dangerous => 
+//       label.description.toLowerCase().includes(dangerous)
+//     )
+//   );
+
+//   if (detectedDangerous.length > 0) {
+//     processed.alerts.push({
+//       type: 'dangerous_object',
+//       message: `Potential dangerous objects detected: ${detectedDangerous.map(d => d.description).join(', ')}`,
+//       severity: 'critical',
+//     });
+//   }
+
+//   return processed;
+// }
+
+// // Upload file to Google Cloud Storage
+// async function uploadToGCS(localPath, gcsPath) {
+//   try {
+//     await storage.bucket(BUCKET_NAME).upload(localPath, {
+//       destination: gcsPath,
+//       metadata: {
+//         cacheControl: 'public, max-age=31536000',
+//       },
+//     });
+//     console.log(`Uploaded to GCS: ${gcsPath}`);
+//   } catch (error) {
+//     console.error(`GCS upload error for ${gcsPath}:`, error);
+//     throw error;
+//   }
+// }
+
+// // Dashboard route
+// app.get('/', (req, res) => {
+//   res.sendFile(path.join(__dirname, 'public', 'dashboard.html'));
+// });
+
+// // Get active streams endpoint
+// app.get('/api/streams', (req, res) => {
+//   const streams = Array.from(activeStreams.entries()).map(([deviceId, stream]) => ({
+//     deviceId,
+//     sessionId: stream.sessionId,
+//     startTime: stream.startTime,
+//     isActive: stream.isActive,
+//     frameCount: stream.frameCount || 0,
+//     lastUpdate: stream.lastUpdate || stream.startTime,
+//   }));
+  
+//   res.json({ streams });
+// });
+
+// // Health check endpoint
+// app.get('/health', (req, res) => {
+//   res.json({
+//     status: 'healthy',
+//     timestamp: new Date(),
+//     activeStreams: activeStreams.size,
+//     activeSessions: deviceSessions.size,
+//     server: 'Heimdall Backend v2.0'
+//   });
+// });
+
+// // Start server
+// server.listen(PORT, () => {
+//   console.log(`🎯 Heimdall Server v2.0 running on port ${PORT}`);
+//   console.log(`📡 WebSocket server ready for video streaming`);
+//   console.log(`🔒 Video Intelligence API initialized`);
+//   console.log(`☁️  Google Cloud Storage configured`);
+//   console.log(`🌐 Dashboard available at: /`);
+// });
+
+// // Graceful shutdown
+// process.on('SIGTERM', () => {
+//   console.log('Shutting down gracefully...');
+//   server.close(() => {
+//     console.log('Server closed');
+//     process.exit(0);
+//   });
+// });
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+require('dotenv').config();
+const express = require('express');
+const http = require('http');
+const socketIo = require('socket.io');
+const multer = require('multer');
+const path = require('path');
+const fs = require('fs').promises;
+const { Storage } = require('@google-cloud/storage');
+const videoIntelligence = require('@google-cloud/video-intelligence').v1;
+const cors = require('cors');
+
+const app = express();
+const server = http.createServer(app);
+const io = socketIo(server, {
+  cors: {
+    origin: "*",
+    methods: ["GET", "POST"],
+    credentials: true
+  },
+  maxHttpBufferSize: 1e8 // 100MB for video streams
 });
 
-// Cleanup function for graceful shutdown
-async function cleanup() {
-  try {
-    console.log('Cleaning up temporary files...');
-    
-    // Process any remaining chunks before shutdown
-    await processVideoChunks();
-    
-    // Clean up temp directory
-    const tempFiles = await fs.readdir(TEMP_DIR);
-    for (const file of tempFiles) {
-      await fs.remove(path.join(TEMP_DIR, file));
-    }
-    
-    console.log('Cleanup completed');
-  } catch (error) {
-    console.error('Error during cleanup:', error);
-  }
-}
+// Configuration
+const PORT = process.env.PORT || 3001;
+const UPLOADS_DIR = path.join(__dirname, 'uploads');
+const BUCKET_NAME = process.env.GCS_BUCKET_NAME || 'videouploader-heimdall';
+const GCLOUD_KEYFILE = path.join(__dirname, process.env.GCLOUD_KEYFILE || 'heimdall-cam.json');
 
-// Handle graceful shutdown
-process.on('SIGINT', async () => {
-  console.log('Received SIGINT, shutting down gracefully...');
-  await cleanup();
-  process.exit(0);
+// Ensure uploads directory exists
+fs.mkdir(UPLOADS_DIR, { recursive: true }).catch(console.error);
+
+// Initialize Google Cloud services
+const storage = new Storage({
+  keyFilename: GCLOUD_KEYFILE,
+  projectId: process.env.GCLOUD_PROJECT_ID,
 });
 
-process.on('SIGTERM', async () => {
-  console.log('Received SIGTERM, shutting down gracefully...');
-  await cleanup();
-  process.exit(0);
+const videoClient = new videoIntelligence.VideoIntelligenceServiceClient({
+  keyFilename: GCLOUD_KEYFILE,
 });
 
-// Error handling middleware
-app.use((error, req, res, next) => {
-  if (error instanceof multer.MulterError) {
-    if (error.code === 'LIMIT_FILE_SIZE') {
-      return res.status(400).json({ error: 'File too large' });
+// Enhanced CORS configuration
+const corsOptions = {
+  origin: function (origin, callback) {
+    if (!origin) return callback(null, true);
+    if (process.env.NODE_ENV === 'development') {
+      return callback(null, true);
     }
+    const allowedOrigins = ['http://localhost:3000', 'react-native-app'];
+    if (allowedOrigins.includes(origin)) {
+      return callback(null, true);
+    }
+    return callback(null, true);
+  },
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'ngrok-skip-browser-warning', 'Origin', 'Accept'],
+  credentials: true,
+  maxAge: 86400
+};
+
+app.use(cors(corsOptions));
+
+// Additional middleware for ngrok compatibility
+app.use((req, res, next) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization, ngrok-skip-browser-warning');
+  res.header('Access-Control-Max-Age', '86400');
+  
+  if (req.method === 'OPTIONS') {
+    return res.status(200).end();
   }
   
-  console.error('Unhandled error:', error);
-  res.status(500).json({ error: 'Internal server error' });
+  next();
+});
+
+app.use(express.json());
+app.use('/uploads', express.static(UPLOADS_DIR));
+app.use(express.static(path.join(__dirname, 'public')));
+
+// Multer configuration for file uploads
+const upload = multer({
+  dest: UPLOADS_DIR,
+  limits: {
+    fileSize: 100 * 1024 * 1024, // 100MB limit
+  },
+  fileFilter: (req, file, cb) => {
+    if (file.mimetype.startsWith('video/')) {
+      cb(null, true);
+    } else {
+      cb(new Error('Only video files are allowed'));
+    }
+  },
+});
+
+// Active streaming sessions with enhanced data
+const activeStreams = new Map();
+const deviceSessions = new Map();
+
+// Enhanced Socket.IO connection handling for smooth video streaming
+io.on('connection', (socket) => {
+  console.log(`📱 Client connected: ${socket.id}`);
+
+  socket.on('register-device', (data) => {
+    const { deviceId, sessionId } = data;
+    
+    socket.deviceId = deviceId;
+    socket.sessionId = sessionId;
+    socket.join(`device-${deviceId}`);
+    
+    deviceSessions.set(deviceId, {
+      socketId: socket.id,
+      sessionId,
+      startTime: new Date(),
+      chunkCount: 0,
+      isStreaming: false,
+      videoStreamActive: false,
+      lastFrameTime: null,
+      streamStats: {
+        totalFrames: 0,
+        fps: 0,
+        lastFpsUpdate: new Date(),
+      }
+    });
+
+    console.log(`✅ Device registered: ${deviceId}`);
+    socket.emit('device-registered', { deviceId, sessionId });
+  });
+
+  socket.on('register-dashboard', () => {
+    socket.join('dashboard');
+    console.log(`📊 Dashboard client registered: ${socket.id}`);
+    
+    // Send current active streams with enhanced info
+    const streams = Array.from(activeStreams.entries()).map(([deviceId, stream]) => ({
+      deviceId,
+      sessionId: stream.sessionId,
+      startTime: stream.startTime,
+      isActive: stream.isActive,
+      videoStreamActive: stream.videoStreamActive || false,
+      lastFrame: stream.lastFrame || null,
+      frameCount: stream.frameCount || 0,
+      fps: stream.fps || 0,
+    }));
+    
+    socket.emit('current-streams', { streams });
+  });
+
+  socket.on('start-stream', (data) => {
+    const { deviceId, sessionId } = data;
+    
+    activeStreams.set(deviceId, {
+      socketId: socket.id,
+      sessionId,
+      isActive: true,
+      videoStreamActive: false,
+      startTime: new Date(),
+      lastFrame: null,
+      frameCount: 0,
+      lastFrameTime: null,
+      fps: 0,
+      frameBuffer: [], // For FPS calculation
+    });
+
+    console.log(`🎬 Stream started for device: ${deviceId}`);
+    
+    // Broadcast to dashboard
+    io.to('dashboard').emit('stream-started', { 
+      deviceId, 
+      sessionId,
+      startTime: new Date(),
+      streamType: 'live',
+    });
+  });
+
+  // Enhanced video stream frame handling (for smooth streaming)
+  socket.on('live-video-frame', (data) => {
+    const { deviceId, frame, timestamp, frameNumber, fps } = data;
+    
+    if (activeStreams.has(deviceId)) {
+      const stream = activeStreams.get(deviceId);
+      
+      // Update stream data
+      stream.lastFrame = frame;
+      stream.frameCount = frameNumber;
+      stream.lastFrameTime = new Date();
+      stream.videoStreamActive = true;
+      
+      // Calculate actual FPS
+      stream.frameBuffer = stream.frameBuffer || [];
+      stream.frameBuffer.push(timestamp);
+      
+      // Keep only last 50 frames for FPS calculation
+      if (stream.frameBuffer.length > 50) {
+        stream.frameBuffer = stream.frameBuffer.slice(-50);
+      }
+      
+      // Calculate FPS every 10 frames
+      if (frameNumber % 10 === 0 && stream.frameBuffer.length >= 10) {
+        const timeSpan = stream.frameBuffer[stream.frameBuffer.length - 1] - stream.frameBuffer[0];
+        const actualFps = Math.round((stream.frameBuffer.length - 1) / (timeSpan / 1000));
+        stream.fps = actualFps;
+      }
+      
+      activeStreams.set(deviceId, stream);
+      
+      // Log every 30 frames (3 seconds at 10 FPS)
+      if (frameNumber % 30 === 0) {
+        console.log(`📹 Live stream frame ${frameNumber} from device ${deviceId} (${stream.fps} FPS)`);
+      }
+      
+      // Broadcast frame to all dashboard clients immediately
+      io.to('dashboard').emit('live-video-frame', {
+        deviceId,
+        frame,
+        timestamp,
+        frameNumber,
+        fps: stream.fps,
+        streamType: 'live',
+        receivedAt: new Date().toISOString(),
+      });
+    }
+  });
+
+  // Enhanced chunk upload handling with immediate analysis
+  socket.on('chunk-uploaded', async (data) => {
+    const { chunkId, sessionId, deviceId } = data;
+    
+    if (deviceSessions.has(deviceId)) {
+      const session = deviceSessions.get(deviceId);
+      session.chunkCount++;
+      deviceSessions.set(deviceId, session);
+    }
+
+    console.log(`📥 Processing chunk: ${chunkId}`);
+    
+    // Send immediate acknowledgment
+    socket.emit('chunk-processing', { chunkId, status: 'processing' });
+    io.to('dashboard').emit('chunk-processing', { deviceId, chunkId, status: 'processing' });
+    
+    // Start analysis
+    try {
+      await processVideoChunk(chunkId, sessionId, deviceId, socket);
+    } catch (error) {
+      console.error(`❌ Analysis failed for ${chunkId}:`, error);
+      socket.emit('analysis-error', { chunkId, error: error.message });
+      io.to('dashboard').emit('analysis-error', { deviceId, chunkId, error: error.message });
+    }
+  });
+
+  socket.on('stop-stream', (data) => {
+    const { deviceId } = data;
+    
+    if (activeStreams.has(deviceId)) {
+      const stream = activeStreams.get(deviceId);
+      stream.videoStreamActive = false;
+      activeStreams.delete(deviceId);
+    }
+    
+    if (deviceSessions.has(deviceId)) {
+      const session = deviceSessions.get(deviceId);
+      session.videoStreamActive = false;
+      deviceSessions.set(deviceId, session);
+    }
+    
+    console.log(`🛑 Live stream stopped for device: ${deviceId}`);
+    io.to('dashboard').emit('stream-stopped', { deviceId });
+  });
+
+  socket.on('disconnect', () => {
+    console.log(`📱 Client disconnected: ${socket.id}`);
+    
+    for (const [deviceId, session] of deviceSessions.entries()) {
+      if (session.socketId === socket.id) {
+        deviceSessions.delete(deviceId);
+        activeStreams.delete(deviceId);
+        io.to('dashboard').emit('stream-stopped', { deviceId });
+        break;
+      }
+    }
+  });
+});
+
+// Enhanced upload chunk endpoint with better error handling
+app.post('/upload-chunk', upload.single('video'), async (req, res) => {
+  const startTime = new Date();
+  console.log(`📥 Upload request received at ${startTime.toISOString()}`);
+  console.log('📋 Request details:', {
+    method: req.method,
+    url: req.url,
+    headers: {
+      'content-type': req.headers['content-type'],
+      'content-length': req.headers['content-length'],
+      'user-agent': req.headers['user-agent'],
+      'origin': req.headers['origin'],
+    },
+    body: req.body,
+    fileInfo: req.file ? {
+      fieldname: req.file.fieldname,
+      originalname: req.file.originalname,
+      encoding: req.file.encoding,
+      mimetype: req.file.mimetype,
+      size: req.file.size,
+      destination: req.file.destination,
+      filename: req.file.filename,
+    } : 'No file received'
+  });
+
+  try {
+    const { sessionId, deviceId, chunkId } = req.body;
+    const videoFile = req.file;
+
+    // Validate required fields
+    if (!sessionId || !deviceId || !chunkId) {
+      console.error('❌ Missing required fields:', { sessionId, deviceId, chunkId });
+      return res.status(400).json({ 
+        error: 'Missing required fields',
+        required: ['sessionId', 'deviceId', 'chunkId'],
+        received: { sessionId, deviceId, chunkId }
+      });
+    }
+
+    if (!videoFile) {
+      console.error('❌ No video file in request');
+      return res.status(400).json({ 
+        error: 'No video file provided',
+        receivedFields: Object.keys(req.body),
+        contentType: req.headers['content-type']
+      });
+    }
+
+    console.log(`✅ Valid upload request for chunk: ${chunkId}`);
+
+    // Create organized file structure
+    const sessionDir = path.join(UPLOADS_DIR, deviceId, sessionId);
+    await fs.mkdir(sessionDir, { recursive: true });
+
+    // Move and rename file
+    const fileName = `${chunkId}.mp4`;
+    const finalPath = path.join(sessionDir, fileName);
+    
+    await fs.rename(videoFile.path, finalPath);
+    console.log(`✅ File saved to: ${finalPath}`);
+
+    // Verify file
+    const stats = await fs.stat(finalPath);
+    console.log(`✅ File verified: ${stats.size} bytes`);
+
+    // Upload to GCS (optional)
+    let gcsPath = null;
+    try {
+      gcsPath = `streams/${deviceId}/${sessionId}/${fileName}`;
+      await uploadToGCS(finalPath, gcsPath);
+      console.log(`✅ Uploaded to GCS: ${gcsPath}`);
+    } catch (gcsError) {
+      console.error('⚠️ GCS upload failed:', gcsError.message);
+      // Continue without GCS
+    }
+
+    const duration = new Date() - startTime;
+    console.log(`✅ Upload completed in ${duration}ms`);
+    
+    res.json({
+      success: true,
+      chunkId,
+      gcsPath,
+      localPath: finalPath,
+      fileSize: stats.size,
+      processingTime: duration,
+      timestamp: new Date(),
+    });
+
+  } catch (error) {
+    const duration = new Date() - startTime;
+    console.error(`❌ Upload failed after ${duration}ms:`, error);
+    res.status(500).json({ 
+      error: 'Upload processing failed',
+      details: error.message,
+      processingTime: duration,
+    });
+  }
+});
+
+// Enhanced video analysis processing
+async function processVideoChunk(chunkId, sessionId, deviceId, socket) {
+  try {
+    const gcsUri = `gs://${BUCKET_NAME}/streams/${deviceId}/${sessionId}/${chunkId}.mp4`;
+    
+    console.log(`🤖 Starting AI analysis for: ${gcsUri}`);
+
+    // Send processing status update
+    const processingStatus = {
+      chunkId,
+      sessionId,
+      deviceId,
+      status: 'analyzing',
+      timestamp: new Date(),
+    };
+    
+    socket.emit('analysis-status', processingStatus);
+    io.to('dashboard').emit('analysis-status', processingStatus);
+
+    const request = {
+      inputUri: gcsUri,
+      features: [
+        'LABEL_DETECTION',
+        'PERSON_DETECTION',
+        'OBJECT_TRACKING',
+        'TEXT_DETECTION',
+      ],
+      videoContext: {
+        personDetectionConfig: {
+          includeBoundingBoxes: true,
+          includeAttributes: true,
+        },
+        labelDetectionConfig: {
+          model: 'builtin/latest',
+        },
+      },
+    };
+
+    const [operation] = await videoClient.annotateVideo(request);
+    console.log(`⏳ Analysis operation started for ${chunkId}`);
+    
+    const [result] = await operation.promise();
+    console.log(`✅ Analysis completed for ${chunkId}`);
+    
+    const analysis = result.annotationResults[0];
+    const processedAnalysis = processAnalysisResults(analysis);
+    
+    // Save analysis results
+    const analysisPath = path.join(UPLOADS_DIR, deviceId, sessionId, `${chunkId}-analysis.json`);
+    await fs.writeFile(analysisPath, JSON.stringify(processedAnalysis, null, 2));
+
+    // Send results to mobile app and dashboard
+    const analysisData = {
+      chunkId,
+      sessionId,
+      deviceId,
+      timestamp: new Date(),
+      status: 'completed',
+      ...processedAnalysis,
+    };
+
+    socket.emit('analysis-result', analysisData);
+    io.to('dashboard').emit('analysis-result', analysisData);
+    
+    console.log(`📊 Analysis results sent for ${chunkId}`);
+
+    // Handle security alerts
+    if (processedAnalysis.alerts && processedAnalysis.alerts.length > 0) {
+      const alertData = {
+        deviceId,
+        sessionId,
+        chunkId,
+        alerts: processedAnalysis.alerts,
+        timestamp: new Date(),
+      };
+      
+      io.emit('security-alert', alertData);
+      console.log(`🚨 Security alert sent for ${chunkId}`);
+    }
+
+  } catch (error) {
+    console.error(`❌ Analysis error for chunk ${chunkId}:`, error);
+    
+    const errorData = {
+      chunkId,
+      sessionId,
+      deviceId,
+      status: 'error',
+      error: error.message,
+      timestamp: new Date(),
+    };
+    
+    socket.emit('analysis-error', errorData);
+    io.to('dashboard').emit('analysis-error', errorData);
+  }
+}
+
+// Enhanced analysis results processing
+function processAnalysisResults(analysis) {
+  const processed = {
+    labels: [],
+    personDetection: {
+      detectedPersons: [],
+      totalCount: 0,
+    },
+    objectTracking: [],
+    textDetections: [],
+    crowdAnalysis: {
+      density: 'low',
+      riskLevel: 'normal',
+    },
+    alerts: [],
+    summary: '',
+  };
+
+  // Process labels
+  if (analysis.labelAnnotations && analysis.labelAnnotations.length > 0) {
+    processed.labels = analysis.labelAnnotations
+      .filter(label => label.entity.description && label.frames.length > 0)
+      .map(label => ({
+        description: label.entity.description,
+        confidence: label.frames[0].confidence || 0,
+        category: label.categoryEntities?.[0]?.description || 'general',
+      }))
+      .sort((a, b) => b.confidence - a.confidence)
+      .slice(0, 10);
+  }
+
+  // Process person detection
+  if (analysis.personDetectionAnnotations && analysis.personDetectionAnnotations.length > 0) {
+    const personAnnotations = analysis.personDetectionAnnotations;
+    processed.personDetection.detectedPersons = personAnnotations.map(person => ({
+      trackId: person.trackId,
+      confidence: person.confidence,
+      attributes: person.attributes || [],
+    }));
+    processed.personDetection.totalCount = personAnnotations.length;
+
+    // Crowd analysis
+    const personCount = personAnnotations.length;
+    if (personCount > 20) {
+      processed.crowdAnalysis.density = 'high';
+      processed.crowdAnalysis.riskLevel = 'elevated';
+      processed.alerts.push({
+        type: 'crowd_density',
+        message: `High crowd density detected: ${personCount} people`,
+        severity: 'warning',
+      });
+    } else if (personCount > 10) {
+      processed.crowdAnalysis.density = 'medium';
+    }
+  }
+
+  // Process object tracking
+  if (analysis.objectAnnotations && analysis.objectAnnotations.length > 0) {
+    processed.objectTracking = analysis.objectAnnotations
+      .filter(obj => obj.entity.description)
+      .map(obj => ({
+        description: obj.entity.description,
+        confidence: obj.confidence,
+        trackId: obj.trackId,
+      }));
+  }
+
+  // Process text detection
+  if (analysis.textAnnotations && analysis.textAnnotations.length > 0) {
+    processed.textDetections = analysis.textAnnotations
+      .map(text => ({
+        text: text.text,
+        confidence: text.confidence,
+      }))
+      .slice(0, 5);
+  }
+
+  // Generate summary
+  const summaryParts = [];
+  if (processed.labels.length > 0) {
+    summaryParts.push(`Objects: ${processed.labels.slice(0, 3).map(l => l.description).join(', ')}`);
+  }
+  if (processed.personDetection.totalCount > 0) {
+    summaryParts.push(`People: ${processed.personDetection.totalCount}`);
+  }
+  if (processed.textDetections.length > 0) {
+    summaryParts.push(`Text detected: ${processed.textDetections.length} items`);
+  }
+  
+  processed.summary = summaryParts.join(' | ') || 'No significant content detected';
+
+  // Safety alerts
+  const dangerousObjects = ['weapon', 'knife', 'gun', 'fire', 'smoke', 'explosion'];
+  const detectedDangerous = processed.labels.filter(label => 
+    dangerousObjects.some(dangerous => 
+      label.description.toLowerCase().includes(dangerous)
+    )
+  );
+
+  if (detectedDangerous.length > 0) {
+    processed.alerts.push({
+      type: 'dangerous_object',
+      message: `Potential dangerous objects: ${detectedDangerous.map(d => d.description).join(', ')}`,
+      severity: 'critical',
+    });
+  }
+
+  return processed;
+}
+
+// Upload file to Google Cloud Storage
+async function uploadToGCS(localPath, gcsPath) {
+  try {
+    await storage.bucket(BUCKET_NAME).upload(localPath, {
+      destination: gcsPath,
+      metadata: {
+        cacheControl: 'public, max-age=31536000',
+      },
+    });
+    console.log(`Uploaded to GCS: ${gcsPath}`);
+  } catch (error) {
+    console.error(`GCS upload error for ${gcsPath}:`, error);
+    throw error;
+  }
+}
+
+// Dashboard route
+app.get('/', (req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'dashboard.html'));
+});
+
+// Enhanced API endpoint for stream info
+app.get('/api/streams', (req, res) => {
+  const streams = Array.from(activeStreams.entries()).map(([deviceId, stream]) => ({
+    deviceId,
+    sessionId: stream.sessionId,
+    startTime: stream.startTime,
+    isActive: stream.isActive,
+    videoStreamActive: stream.videoStreamActive || false,
+    frameCount: stream.frameCount || 0,
+    fps: stream.fps || 0,
+    lastUpdate: stream.lastFrameTime || stream.startTime,
+  }));
+  
+  res.json({ streams });
+});
+
+// Get device session info
+app.get('/api/device/:deviceId/session', (req, res) => {
+  const { deviceId } = req.params;
+  const session = deviceSessions.get(deviceId);
+  
+  if (!session) {
+    return res.status(404).json({ error: 'Device session not found' });
+  }
+  
+  res.json(session);
+});
+
+// Get analysis results for a specific chunk
+app.get('/api/analysis/:deviceId/:sessionId/:chunkId', async (req, res) => {
+  try {
+    const { deviceId, sessionId, chunkId } = req.params;
+    const analysisPath = path.join(UPLOADS_DIR, deviceId, sessionId, `${chunkId}-analysis.json`);
+    
+    const data = await fs.readFile(analysisPath, 'utf8');
+    res.json(JSON.parse(data));
+  } catch (error) {
+    res.status(404).json({ error: 'Analysis not found' });
+  }
+});
+
+// Health check endpoint
+app.get('/health', (req, res) => {
+  res.json({
+    status: 'healthy',
+    timestamp: new Date(),
+    activeStreams: activeStreams.size,
+    activeSessions: deviceSessions.size,
+    server: 'Heimdall Backend v2.0'
+  });
 });
 
 // Start server
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`Heimdall Cam Backend running on port ${PORT}`);
-  console.log(`GCP Bucket: ${bucketName}`);
-  console.log('Video processing scheduled every 10 sec');
+server.listen(PORT, () => {
+  console.log(`🎯 Heimdall Server v2.0 running on port ${PORT}`);
+  console.log(`📡 WebSocket server ready for video streaming`);
+  console.log(`🔒 Video Intelligence API initialized`);
+  console.log(`☁️  Google Cloud Storage configured`);
+  console.log(`🌐 Dashboard available at: /`);
 });
 
-module.exports = app;
+// Graceful shutdown
+process.on('SIGTERM', () => {
+  console.log('Shutting down gracefully...');
+  server.close(() => {
+    console.log('Server closed');
+    process.exit(0);
+  });
+});

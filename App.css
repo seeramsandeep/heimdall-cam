@@ -1,0 +1,224 @@
+.container {
+  display: flex;
+  flex: 1;
+  background-color: #000;
+}
+
+.header {
+  position: absolute;
+  top: 50px;
+  left: 20px;
+  z-index: 10;
+}
+
+.brandText {
+  color: #ff6b35;
+  font-size: 28px;
+  font-weight: 900;
+  letter-spacing: 3px;
+  text-shadow: 2px 2px 4px #000;
+}
+
+.subtitle {
+  color: #fff;
+  font-size: 12px;
+  letter-spacing: 1px;
+  margin-top: 2px;
+}
+
+.camera {
+  flex: 1;
+}
+
+.statusOverlay {
+  position: absolute;
+  top: 50px;
+  right: 20px;
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  background-color: rgba(0,0,0,0.7);
+  padding: 6px 12px;
+  border-radius: 20px;
+}
+
+.statusDot {
+  width: 10px;
+  height: 10px;
+  border-radius: 5px;
+  margin-right: 8px;
+}
+
+.statusText {
+  color: #fff;
+  font-size: 12px;
+  font-weight: bold;
+}
+
+.uploadStatusContainer {
+  position: absolute;
+  top: 90px;
+  right: 20px;
+  background-color: rgba(0,0,0,0.7);
+  padding: 6px 12px;
+  border-radius: 15px;
+  max-width: 200px;
+}
+
+.uploadStatusText {
+  color: #00ff00;
+  font-size: 10px;
+  font-weight: bold;
+}
+
+.analysisContainer {
+  position: absolute;
+  top: 120px;
+  left: 20px;
+  right: 20px;
+  background-color: rgba(0,0,0,0.8);
+  padding: 12px;
+  border-radius: 8px;
+}
+
+.analysisTitle {
+  color: #ff6b35;
+  font-size: 14px;
+  font-weight: bold;
+  margin-bottom: 4px;
+}
+
+.analysisText {
+  color: #fff;
+  font-size: 12px;
+}
+
+.controls {
+  position: absolute;
+  bottom: 50px;
+  left: 20px;
+  right: 20px;
+  display: flex;
+  align-items: center;
+}
+
+.sessionInfo {
+  background-color: rgba(0,0,0,0.7);
+  padding: 8px;
+  border-radius: 8px;
+  margin-bottom: 20px;
+  display: flex;
+  align-items: center;
+  flex-direction: column;
+}
+
+.sessionText {
+  color: #ccc;
+  font-size: 10px;
+}
+
+.recordButton {
+  background-color: #ff6b35;
+  padding: 15px 40px;
+  border-radius: 30px;
+  box-shadow: 0 2px 5px rgba(0,0,0,0.2);
+  border: none;
+  cursor: pointer;
+}
+
+.recordButtonActive {
+  background-color: #ff3333;
+}
+
+.recordButtonText {
+  color: #fff;
+  font-size: 16px;
+  font-weight: bold;
+  letter-spacing: 1px;
+}
+
+.permissionContainer {
+  display: flex;
+  flex: 1;
+  justify-content: center;
+  align-items: center;
+  background-color: #000;
+  padding: 20px;
+}
+
+.permissionText {
+  color: #fff;
+  font-size: 16px;
+  margin-bottom: 30px;
+  text-align: center;
+  line-height: 24px;
+}
+
+.buttonContainer {
+  display: flex;
+  flex-direction: column;
+  gap: 15px;
+}
+
+.button {
+  background-color: #ff6b35;
+  padding: 12px 24px;
+  border-radius: 8px;
+  min-width: 200px;
+  display: flex;
+  align-items: center;
+  margin-top: 20px;
+  border: none;
+  cursor: pointer;
+}
+
+.secondaryButton {
+  background-color: #666;
+}
+
+.buttonText {
+  color: #fff;
+  font-size: 16px;
+  font-weight: bold;
+}
+
+.loadingContainer {
+  display: flex;
+  flex: 1;
+  justify-content: center;
+  align-items: center;
+  background-color: #000;
+}
+
+.loadingText {
+  color: #ff6b35;
+  font-size: 20px;
+  font-weight: bold;
+  margin-top: 20px;
+  text-align: center;
+}
+
+.errorContainer {
+  display: flex;
+  flex: 1;
+  justify-content: center;
+  align-items: center;
+  background-color: #000;
+  padding: 20px;
+}
+
+.errorTitle {
+  color: #ff0000;
+  font-size: 24px;
+  font-weight: bold;
+  margin-bottom: 20px;
+  margin-top: 20px;
+}
+
+.errorText {
+  color: #fff;
+  font-size: 16px;
+  text-align: center;
+  margin-bottom: 30px;
+  line-height: 24px;
+}
