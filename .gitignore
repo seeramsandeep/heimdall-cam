@@ -76,3 +76,4 @@ yarn-error.log
 
 
 /backend/heimdall-cam.json
+/backend/.env

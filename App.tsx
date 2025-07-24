@@ -24,7 +24,7 @@ import DeviceInfo from 'react-native-device-info';
 import RNFS from 'react-native-fs';
 
 const { width, height } = Dimensions.get('window');
-const BACKEND_URL = 'https://0cc63893afff.ngrok-free.app'; // Replace with your ngrok URL
+const BACKEND_URL = 'https://c6f4f7b04f88.ngrok-free.app'; // Replace with your ngrok URL
 const CHUNK_DURATION = 5 * 60 * 1000; // 5 minutes
 
 export default function App() {
@@ -49,6 +49,7 @@ export default function App() {
 
   // WebRTC and streaming refs
   const frameIntervalRef = useRef<NodeJS.Timeout | null>(null);
+  const videoStreamActiveRef = useRef(videoStreamActive);
 
   const { hasPermission: cameraPermission, requestPermission: requestCameraPermission } = useCameraPermission();
   const { hasPermission: microphonePermission, requestPermission: requestMicrophonePermission } = useMicrophonePermission();
@@ -77,9 +78,13 @@ export default function App() {
     }
   }, [isInitialized, cameraDevice, deviceCheckCount]);
 
+  useEffect(() => {
+    videoStreamActiveRef.current = videoStreamActive;
+  }, [videoStreamActive]);
+
   const getAllDeviceInfo = () => {
     if (!devices || Object.keys(devices).length === 0) {
-      console.log('❌ No camera devices available');
+      console.log('No camera devices available');
       return [];
     }
 
@@ -133,7 +138,7 @@ export default function App() {
 
   const findCameraDevice = () => {
     try {
-      console.log('🔍 Finding camera device...');
+      console.log('Finding camera device...');
       const allDevices = getAllDeviceInfo();
       console.log('📱 Available camera devices:');
       allDevices.forEach((device: any, index: number) => {
@@ -164,25 +169,25 @@ export default function App() {
       }
 
       if (device && selectedDeviceInfo) {
-        console.log('\n🎯 Final Camera Selection:');
-        console.log(`   Device ID: ${selectedDeviceInfo.id}`);
-        console.log(`   Name: ${selectedDeviceInfo.name}`);
-        console.log(`   Position: ${selectedDeviceInfo.position}`);
-        console.log(`   Available Formats: ${selectedDeviceInfo.formatCount}`);
+        console.log('\nFinal Camera Selection:');
+        console.log(`Device ID: ${selectedDeviceInfo.id}`);
+        console.log(`Name: ${selectedDeviceInfo.name}`);
+        console.log(`Position: ${selectedDeviceInfo.position}`);
+        console.log(`Available Formats: ${selectedDeviceInfo.formatCount}`);
         setCameraDevice(device);
         setDeviceInfo(selectedDeviceInfo);
       } else {
-        console.log('\n❌ No suitable camera device found');
+        console.log('\nNo suitable camera device found');
         if (deviceCheckCount >= 9) {
           setError('No camera device available. Please check if your device has a working camera.');
         }
       }
     } catch (error) {
       if (error instanceof Error) {
-        console.error('❌ Error finding camera device:', error.message);
+        console.error('Error finding camera device:', error.message);
         setError(`Camera detection error: ${error.message}`);
       } else {
-        console.error('❌ Error finding camera device:', error);
+        console.error('Error finding camera device:', error);
         setError('Camera detection error');
       }
     }
@@ -298,11 +303,11 @@ export default function App() {
 
   const testBackendConnection = async () => {
     try {
-      console.log('🔍 Testing backend connection...');
+      console.log('Testing backend connection...');
       const controller = new AbortController();
       const timeoutId = setTimeout(() => {
         controller.abort();
-        console.log('⏰ Backend connection test timeout');
+        console.log('Backend connection test timeout');
       }, 8000);
       const response = await fetch(`${BACKEND_URL}/health`, {
         method: 'GET',
@@ -316,17 +321,17 @@ export default function App() {
       clearTimeout(timeoutId);
       if (response.ok) {
         const data = await response.json();
-        console.log('✅ Backend is reachable:', data);
+        console.log('Backend is reachable:', data);
         return true;
       } else {
-        console.log('❌ Backend responded with error:', response.status, await response.text());
+        console.log('Backend responded with error:', response.status, await response.text());
         return false;
       }
     } catch (error) {
       if (error instanceof Error && error.name === 'AbortError') {
-        console.error('❌ Backend connection test timeout');
+        console.error('Backend connection test timeout');
       } else {
-        console.error('❌ Backend connection test failed:', error);
+        console.error('Backend connection test failed:', error);
       }
       return false;
     }
@@ -364,7 +369,7 @@ export default function App() {
 
         newSocket.on('connect', () => {
           clearTimeout(connectionTimeout);
-          console.log('✅ Socket connected successfully');
+          console.log('Socket connected successfully');
           setConnectionStatus('Connected');
           newSocket.emit('register-device', { deviceId, sessionId });
           resolve(newSocket);
@@ -372,7 +377,7 @@ export default function App() {
 
         newSocket.on('connect_error', (error) => {
           clearTimeout(connectionTimeout);
-          console.error('❌ Socket connection failed:', error);
+          console.error('Socket connection failed:', error);
           newSocket.disconnect();
           reject(error);
         });
@@ -409,14 +414,14 @@ export default function App() {
       setVideoStreamActive(true);
       setStreamingStatus('Video stream active');
       startSmoothFrameStreaming(socketConnection);
-      console.log('✅ WebRTC video streaming started');
+      console.log('WebRTC video streaming started');
     } catch (error: any) {
       if (error instanceof Error) {
-        console.error('❌ Video streaming setup failed:', error.message);
+        console.error('Video streaming setup failed:', error.message);
         setStreamingStatus('Video streaming failed');
         throw error;
       } else {
-        console.error('❌ Video streaming setup failed:', error);
+        console.error('Video streaming setup failed:', error);
         setStreamingStatus('Video streaming failed');
         throw new Error('Video streaming failed');
       }
@@ -424,18 +429,18 @@ export default function App() {
   };
 
   const startSmoothFrameStreaming = (socketConnection: any) => {
-    console.log('🎬 Starting smooth frame streaming...');
+    console.log('Starting smooth frame streaming...');
     let frameCount = 0;
     frameIntervalRef.current = setInterval(async () => {
       try {
-        if (!camera.current || !(socketConnection && socketConnection.connected) || !videoStreamActive) {
+        if (!camera.current || !(socketConnection && socketConnection.connected) || !videoStreamActiveRef.current) {
           if (!camera.current) {
             console.log('Camera ref is null in frame streaming!');
           }
           if (!(socketConnection && socketConnection.connected)) {
             console.log('Socket not connected in frame streaming!');
           }
-          if (!videoStreamActive) {
+          if (!videoStreamActiveRef.current) {
             console.log('Video stream not active in frame streaming!');
           }
           return;
@@ -461,16 +466,16 @@ export default function App() {
             fps: 10,
           });
           if (frameCount % 30 === 0) {
-            console.log(`📹 Streaming frame ${frameCount} (10 FPS)`);
+            console.log(`Streaming frame ${frameCount} (10 FPS)`);
             setStreamingStatus(`Live streaming: ${frameCount} frames`);
           }
         }
       } catch (error: any) {
         if (error && error.code === 'capture/photo-not-enabled') {
-          console.error('❌ Photo capture not enabled for streaming');
+          console.error('Photo capture not enabled for streaming');
           stopVideoStreaming();
         } else {
-          console.error('❌ Frame streaming error:', error);
+          console.error('Frame streaming error:', error);
         }
       }
     }, 100); // 100ms = 10 FPS
@@ -504,10 +509,10 @@ export default function App() {
       try {
         connectedSocket = await connectToServer();
         setSocket(connectedSocket);
-        console.log('✅ Socket connection established');
+        console.log('Socket connection established');
         connectedSocket.emit('start-stream', { deviceId, sessionId });
       } catch (connectionError: any) {
-        console.error('❌ Failed to connect to server:', connectionError);
+        console.error('Failed to connect to server:', connectionError);
         setIsStreaming(false);
         setConnectionStatus('Connection Failed');
         Alert.alert('Connection Failed', `Unable to connect to server: ${connectionError.message}`);
@@ -515,7 +520,7 @@ export default function App() {
       }
 
       if (!connectedSocket || !connectedSocket.connected) {
-        console.error('❌ Socket not properly connected');
+        console.error('Socket not properly connected');
         setIsStreaming(false);
         setConnectionStatus('Connection Failed');
         return;
@@ -529,10 +534,10 @@ export default function App() {
       await startChunkedRecording();
 
       setConnectionStatus('Live Streaming');
-      console.log('✅ Enhanced streaming started successfully');
+      console.log('Enhanced streaming started successfully');
 
     } catch (error: any) {
-      console.error('❌ Start streaming error:', error);
+      console.error('Start streaming error:', error);
       setIsStreaming(false);
       setConnectionStatus('Connection Failed');
       setError(`Failed to start streaming: ${error.message}`);
@@ -581,7 +586,7 @@ export default function App() {
     setUploadStatus(`Uploading chunk ${chunkCount}...`);
     
     if (!video || !video.path) {
-      console.error('❌ Invalid video object:', video);
+      console.error('Invalid video object:', video);
       setUploadStatus('Upload failed: Invalid video file');
       return;
     }
@@ -611,7 +616,7 @@ export default function App() {
         const controller = new AbortController();
         const timeoutId = setTimeout(() => {
           controller.abort();
-          console.log('⏰ Upload timeout after 90 seconds');
+          console.log('Upload timeout after 90 seconds');
         }, 90000);
 
         const response = await fetch(`${BACKEND_URL}/upload-chunk`, {
@@ -627,8 +632,8 @@ export default function App() {
 
         if (response.ok) {
           const result = await response.json();
-          console.log(`✅ Chunk ${chunkCount} uploaded successfully:`, result);
-          setUploadStatus(`✅ Chunk ${chunkCount} uploaded successfully`);
+          console.log(`Chunk ${chunkCount} uploaded successfully:`, result);
+          setUploadStatus(`Chunk ${chunkCount} uploaded successfully`);
           
           if (socket && socket.connected) {
             socket.emit('chunk-uploaded', { chunkId, sessionId, deviceId });
@@ -639,38 +644,38 @@ export default function App() {
           
         } else {
           const errorText = await response.text();
-          console.error(`❌ Upload failed with status: ${response.status}`);
-          console.error('❌ Error response:', errorText);
+          console.error(`Upload failed with status: ${response.status}`);
+          console.error('Error response:', errorText);
           
           if (response.status >= 500) {
             throw new Error(`Server error: ${response.status} - ${errorText}`);
           } else {
-            setUploadStatus(`❌ Upload failed: ${response.status}`);
+            setUploadStatus(`Upload failed: ${response.status}`);
             return;
           }
         }
         
       } catch (error: any) {
-        console.error(`❌ Upload error (Attempt ${retryCount + 1}):`, error);
+        console.error(`Upload error (Attempt ${retryCount + 1}):`, error);
         retryCount++;
         
         let errorMessage = 'Unknown error';
         
         if (error.name === 'AbortError') {
           errorMessage = 'Request timeout';
-          setUploadStatus('❌ Upload timeout');
+          setUploadStatus('Upload timeout');
         } else if (error.message && error.message.includes('Network request failed')) {
           errorMessage = 'Network connectivity issue';
-          setUploadStatus(`❌ Network error (${retryCount}/${maxRetries})`);
+          setUploadStatus(`Network error (${retryCount}/${maxRetries})`);
         } else if (error.message && error.message.includes('not reachable')) {
           errorMessage = 'Backend server not accessible';
-          setUploadStatus(`❌ Server unreachable (${retryCount}/${maxRetries})`);
+          setUploadStatus(`Server unreachable (${retryCount}/${maxRetries})`);
         } else {
           errorMessage = error.message;
-          setUploadStatus(`❌ Upload error: ${error.message}`);
+          setUploadStatus(`Upload error: ${error.message}`);
         }
         
-        console.log(`🔄 Will retry in ${Math.pow(2, retryCount)}s due to: ${errorMessage}`);
+        console.log(`Will retry in ${Math.pow(2, retryCount)}s due to: ${errorMessage}`);
         
         if (retryCount < maxRetries) {
           const delay = Math.pow(2, retryCount) * 1000;
@@ -679,7 +684,7 @@ export default function App() {
       }
     }
     
-    setUploadStatus(`❌ Upload failed after ${maxRetries} attempts`);
+    setUploadStatus(`Upload failed after ${maxRetries} attempts`);
     
     Alert.alert(
       'Upload Failed',
@@ -706,22 +711,22 @@ export default function App() {
       if (camera.current) {
         try {
           await camera.current.stopRecording();
-          console.log('✅ Camera recording stopped');
+          console.log('Camera recording stopped');
         } catch (error) {
-          console.error('❌ Error stopping camera:', error);
+          console.error('Error stopping camera:', error);
         }
       }
 
-      console.log('✅ Video streaming stopped successfully');
+      console.log('Video streaming stopped successfully');
 
     } catch (error) {
-      console.error('❌ Stop video streaming error:', error);
+      console.error('Stop video streaming error:', error);
     }
   };
 
   const stopStreaming = async () => {
     try {
-      console.log('🛑 Stopping all streaming...');
+      console.log('Stopping all streaming...');
       
       setIsStreaming(false);
       setIsRecording(false);
@@ -737,9 +742,9 @@ export default function App() {
           }
           socket.disconnect();
           setSocket(null);
-          console.log('✅ Socket disconnected');
+          console.log('Socket disconnected');
         } catch (error) {
-          console.error('❌ Error disconnecting socket:', error);
+          console.error('Error disconnecting socket:', error);
         }
       }
 
@@ -749,10 +754,10 @@ export default function App() {
       setAnalysisResults([]);
       setConnectionStatus('Disconnected');
 
-      console.log('✅ All streaming stopped successfully');
+      console.log('All streaming stopped successfully');
 
     } catch (error) {
-      console.error('❌ Stop streaming error:', error);
+      console.error('Stop streaming error:', error);
       setConnectionStatus('Disconnected');
     }
   };
@@ -783,7 +788,7 @@ export default function App() {
     return (
       <View style={styles.errorContainer}>
         <Text style={styles.brandText}>HEIMDALL</Text>
-        <Text style={styles.errorTitle}>⚠️ Error</Text>
+        <Text style={styles.errorTitle}>Error</Text>
         <Text style={styles.errorText}>{error}</Text>
         <View style={styles.buttonContainer}>
           <TouchableOpacity style={styles.button} onPress={() => {
