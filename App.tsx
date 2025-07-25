@@ -24,7 +24,7 @@ import DeviceInfo from 'react-native-device-info';
 import RNFS from 'react-native-fs';
 
 const { width, height } = Dimensions.get('window');
-const BACKEND_URL = 'https://c6f4f7b04f88.ngrok-free.app'; // Replace with your ngrok URL
+const BACKEND_URL = 'https://6571258e96d1.ngrok-free.app'; // Replace with your ngrok URL
 const CHUNK_DURATION = 5 * 60 * 1000; // 5 minutes
 
 export default function App() {
