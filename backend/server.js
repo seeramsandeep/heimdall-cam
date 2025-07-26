@@ -134,6 +134,7 @@ const upload = multer({
 // Active recording sessions
 const activeSessions = new Map();
 const uploadQueue = new Map(); // Track upload status
+const analysisResults = new Map(); // Store analysis results by gcsUri
 
 // Immediate GCP upload function with presigned URL generation
 async function uploadToGCPImmediately(localFilePath, gcsPath, metadata = {}) {
@@ -350,11 +351,18 @@ function startTempFileMonitoring() {
 
 // Health check
 app.get('/health', (req, res) => {
+  const analysisStats = {
+    total: analysisResults.size,
+    completed: Array.from(analysisResults.values()).filter(a => !a.error && !a.status).length,
+    failed: Array.from(analysisResults.values()).filter(a => a.status === 'failed').length
+  };
+
   res.json({
     status: 'healthy',
     timestamp: new Date(),
     server: 'Heimdall Backend v3.0',
     activeSessions: activeSessions.size,
+    analysisResults: analysisStats,
     services: {
       gcs: {
         enabled: GCS_ENABLED,
@@ -627,15 +635,19 @@ app.get('/videos', async (req, res) => {
               expires: Date.now() + 48 * 60 * 60 * 1000,
             });
 
+            const gcsUri = `gs://${BUCKET_NAME}/${file.name}`;
+            const analysisData = analysisResults.get(gcsUri);
+
             return {
               filename: file.name,
-              gcsUri: `gs://${BUCKET_NAME}/${file.name}`,
+              gcsUri,
               presignedUrl,
               expiresAt: new Date(Date.now() + 48 * 60 * 60 * 1000).toISOString(),
               size: metadata.size,
               created: metadata.timeCreated,
               updated: metadata.updated,
-              analysisStatus: metadata.metadata?.analysisStatus || 'pending',
+              analysisStatus: analysisData ? (analysisData.status === 'failed' ? 'failed' : 'completed') : 'pending',
+              analysisCompletedAt: analysisData?.completedAt,
               deviceId: metadata.metadata?.deviceId || 'unknown',
               sessionId: file.name.split('/')[2] || 'unknown', // Extract from path
               chunkIndex: metadata.metadata?.chunkIndex || 'unknown'
@@ -660,6 +672,164 @@ app.get('/videos', async (req, res) => {
 
   } catch (error) {
     console.error('❌ Error listing videos:', error.message);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+// Get videos by device ID
+app.get('/videos/device/:deviceId', async (req, res) => {
+  try {
+    const { deviceId } = req.params;
+    
+    if (!GCS_ENABLED) {
+      return res.status(503).json({
+        success: false,
+        error: 'GCS not enabled'
+      });
+    }
+
+    const bucket = storage.bucket(BUCKET_NAME);
+    const [files] = await bucket.getFiles({
+      prefix: `devices/${deviceId}/`, // Filter by device ID
+    });
+
+    const videos = await Promise.all(
+      files
+        .filter(file => file.name.endsWith('.mp4') || file.name.endsWith('.mov') || file.name.endsWith('.mkv'))
+        .map(async (file) => {
+          try {
+            const [metadata] = await file.getMetadata();
+            
+            // Generate new presigned URL (48 hours)
+            const [presignedUrl] = await file.getSignedUrl({
+              action: 'read',
+              expires: Date.now() + 48 * 60 * 60 * 1000,
+            });
+
+            const gcsUri = `gs://${BUCKET_NAME}/${file.name}`;
+            const analysisData = analysisResults.get(gcsUri);
+
+            return {
+              filename: file.name,
+              gcsUri,
+              presignedUrl,
+              expiresAt: new Date(Date.now() + 48 * 60 * 60 * 1000).toISOString(),
+              size: metadata.size,
+              created: metadata.timeCreated,
+              updated: metadata.updated,
+              analysisStatus: analysisData ? (analysisData.status === 'failed' ? 'failed' : 'completed') : 'pending',
+              analysisCompletedAt: analysisData?.completedAt,
+              deviceId: metadata.metadata?.deviceId || deviceId,
+              sessionId: file.name.split('/')[2] || 'unknown',
+              chunkIndex: metadata.metadata?.chunkIndex || 'unknown'
+            };
+          } catch (error) {
+            console.warn(`⚠️  Could not get metadata for ${file.name}:`, error.message);
+            return {
+              filename: file.name,
+              gcsUri: `gs://${BUCKET_NAME}/${file.name}`,
+              error: 'Metadata unavailable'
+            };
+          }
+        })
+    );
+
+    const validVideos = videos.filter(v => !v.error);
+
+    res.json({
+      success: true,
+      deviceId,
+      videos: validVideos,
+      total: validVideos.length,
+      analysisStatus: {
+        completed: validVideos.filter(v => v.analysisStatus === 'completed').length,
+        pending: validVideos.filter(v => v.analysisStatus === 'pending').length,
+        failed: validVideos.filter(v => v.analysisStatus === 'failed').length
+      },
+      timestamp: new Date().toISOString()
+    });
+
+  } catch (error) {
+    console.error('❌ Error listing videos for device:', error.message);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+// Get analysis results for a specific video
+app.get('/analysis/:gcsUri(*)', async (req, res) => {
+  try {
+    const gcsUri = req.params.gcsUri;
+    
+    if (!gcsUri) {
+      return res.status(400).json({
+        success: false,
+        error: 'GCS URI is required'
+      });
+    }
+
+    // Reconstruct full GCS URI if needed
+    const fullGcsUri = gcsUri.startsWith('gs://') ? gcsUri : `gs://${BUCKET_NAME}/${gcsUri}`;
+    
+    const analysisData = analysisResults.get(fullGcsUri);
+    
+    if (!analysisData) {
+      return res.status(404).json({
+        success: false,
+        error: 'Analysis results not found for this video',
+        gcsUri: fullGcsUri,
+        message: 'Video may not have been analyzed yet. Use POST /analyze-video to start analysis.'
+      });
+    }
+
+    res.json({
+      success: true,
+      gcsUri: fullGcsUri,
+      analysis: analysisData,
+      timestamp: new Date().toISOString()
+    });
+
+  } catch (error) {
+    console.error('❌ Error retrieving analysis results:', error.message);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+// Get all analysis results
+app.get('/analysis', (req, res) => {
+  try {
+    const allAnalysis = Array.from(analysisResults.entries()).map(([gcsUri, data]) => ({
+      gcsUri,
+      ...data
+    }));
+
+    const summary = {
+      total: allAnalysis.length,
+      completed: allAnalysis.filter(a => !a.error && !a.status).length,
+      failed: allAnalysis.filter(a => a.status === 'failed').length,
+      byType: {
+        manual: allAnalysis.filter(a => a.type === 'manual').length,
+        bulk: allAnalysis.filter(a => a.type === 'bulk').length
+      }
+    };
+
+    res.json({
+      success: true,
+      analysis: allAnalysis,
+      summary,
+      timestamp: new Date().toISOString()
+    });
+
+  } catch (error) {
+    console.error('❌ Error retrieving all analysis results:', error.message);
     res.status(500).json({
       success: false,
       error: error.message
@@ -698,10 +868,30 @@ app.post('/analyze-video', async (req, res) => {
     })
       .then(result => {
         console.log(`✅ Manual analysis completed [${analysisId}]`);
-        // Could store results in database here
+        
+        // Store analysis results for later retrieval
+        analysisResults.set(gcsUri, {
+          analysisId,
+          gcsUri,
+          result,
+          completedAt: new Date().toISOString(),
+          type: 'manual'
+        });
+        
+        console.log(`💾 Analysis results stored for: ${gcsUri}`);
       })
       .catch(error => {
         console.error(`❌ Manual analysis failed [${analysisId}]:`, error.message);
+        
+        // Store error results too
+        analysisResults.set(gcsUri, {
+          analysisId,
+          gcsUri,
+          error: error.message,
+          completedAt: new Date().toISOString(),
+          type: 'manual',
+          status: 'failed'
+        });
       });
 
     res.json({
@@ -774,9 +964,30 @@ app.post('/analyze-all-videos', async (req, res) => {
           })
             .then(result => {
               console.log(`✅ Bulk analysis completed [${analysisId}] for: ${file.name}`);
+              
+              // Store analysis results for later retrieval
+              analysisResults.set(gcsUri, {
+                analysisId,
+                gcsUri,
+                filename: file.name,
+                result,
+                completedAt: new Date().toISOString(),
+                type: 'bulk'
+              });
             })
             .catch(error => {
               console.error(`❌ Bulk analysis failed [${analysisId}] for ${file.name}:`, error.message);
+              
+              // Store error results too
+              analysisResults.set(gcsUri, {
+                analysisId,
+                gcsUri,
+                filename: file.name,
+                error: error.message,
+                completedAt: new Date().toISOString(),
+                type: 'bulk',
+                status: 'failed'
+              });
             });
 
           pendingCount++;
