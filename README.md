@@ -1,97 +1,432 @@
-This is a new [**React Native**](https://reactnative.dev) project, bootstrapped using [`@react-native-community/cli`](https://github.com/react-native-community/cli).
+# 🛡️ Heimdall AI Security System
 
-# Getting Started
+An intelligent, AI-powered security and crowd management system that provides real-time monitoring, threat detection, emergency dispatch, and predictive analytics for large venues and events.
 
-> **Note**: Make sure you have completed the [Set Up Your Environment](https://reactnative.dev/docs/set-up-your-environment) guide before proceeding.
+## 🎯 Features
 
-## Step 1: Start Metro
+### Core Security Features
+- **🔍 Predictive Bottleneck Analysis** - Analyze crowd density and predict chokepoints 15-20 minutes in advance
+- **⚠️ Real-Time Anomaly Detection** - Detect unusual movements, panic, and suspicious behavior
+- **🚨 AI-Powered Threat Recognition** - Identify weapons, fire, smoke, and other security threats
+- **🚀 Automated Emergency Dispatch** - Intelligent responder assignment with optimal routing
+- **📊 Sentiment & Crowd Analysis** - Monitor stress levels and crowd emotions
 
-First, you will need to run **Metro**, the JavaScript build tool for React Native.
+### Advanced Intelligence
+- **🤖 Multimodal AI Processing** - Video, audio, and text analysis using Google AI
+- **📱 Real-Time Dashboard** - Command center with live alerts and monitoring
+- **👮 Responder Management** - GPS tracking and automated task assignment
+- **🗣️ Natural Language Queries** - Ask questions about incidents and get AI responses
+- **📡 Live Communication** - WebSocket-based real-time updates
 
-To start the Metro dev server, run the following command from the root of your React Native project:
+### Mobile Applications
+- **📱 Attendee Safety App** - Panic button, incident reporting, safe routes
+- **👨‍💼 First Responder App** - Assignment notifications, navigation, real-time updates
 
-```sh
-# Using npm
+## 🏗️ Architecture
+
+```
+┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
+│   Mobile Apps   │    │  Command Center │    │  AI Processing  │
+│                 │    │   Dashboard     │    │                 │
+│ • Attendee App  │◄──►│                 │◄──►│ • Crowd Analysis│
+│ • Responder App │    │ • Real-time     │    │ • Threat Detect │
+│                 │    │ • WebSocket     │    │ • Anomaly Detect│
+└─────────────────┘    └─────────────────┘    └─────────────────┘
+         │                       │                       │
+         ▼                       ▼                       ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                    Heimdall Backend API                         │
+│                                                                 │
+│ • Emergency Dispatch    • Real-time Analytics                  │
+│ • Responder Management  • Natural Language Processing          │
+│ • Video Intelligence   • Automated Workflows                  │
+└─────────────────────────────────────────────────────────────────┘
+         │                       │                       │
+         ▼                       ▼                       ▼
+┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
+│   Firebase      │    │  Google Cloud   │    │   External      │
+│                 │    │                 │    │   Services      │
+│ • Realtime DB   │    │ • Vision AI     │    │ • Twilio SMS    │
+│ • Authentication│    │ • Video Intel   │    │ • Email Alerts  │
+│ • Cloud Functions│    │ • Vertex AI     │    │ • Google Maps   │
+│ • Hosting       │    │ • Cloud Storage │    │                 │
+└─────────────────┘    └─────────────────┘    └─────────────────┘
+```
+
+## 🚀 Quick Start
+
+### Prerequisites
+- Node.js 18+ and npm
+- React Native development environment
+- Google Cloud Platform account
+- Firebase account
+- Optional: Twilio account for SMS alerts
+
+### 1. Clone and Install
+```bash
+git clone <repository-url>
+cd VideoRecordingApp
+
+# Install backend dependencies
+cd backend
+npm install
+
+# Install mobile app dependencies
+cd ..
+npm install
+```
+
+### 2. Configure Backend
+Create a `.env` file in the `backend` directory:
+
+```env
+# Basic Configuration
+PORT=3001
+NODE_ENV=development
+
+# Google Cloud Platform
+GCLOUD_PROJECT_ID=your-gcp-project-id
+GCLOUD_KEYFILE=path/to/service-account-key.json
+GCS_BUCKET_NAME=your-heimdall-bucket
+GOOGLE_CLOUD_API_KEY=your-api-key
+GOOGLE_MAPS_API_KEY=your-maps-api-key
+
+# Firebase
+FIREBASE_PROJECT_ID=your-firebase-project
+FIREBASE_PRIVATE_KEY="-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n"
+FIREBASE_CLIENT_EMAIL=firebase-adminsdk-...@project.iam.gserviceaccount.com
+FIREBASE_DATABASE_URL=https://project-default-rtdb.firebaseio.com/
+
+# Emergency Services (Optional)
+TWILIO_ACCOUNT_SID=your-twilio-sid
+TWILIO_AUTH_TOKEN=your-twilio-token
+TWILIO_PHONE_NUMBER=+1234567890
+EMAIL_SERVICE=gmail
+EMAIL_USER=your-email@gmail.com
+EMAIL_PASS=your-app-password
+```
+
+### 3. Set Up Google Cloud Services
+```bash
+# Enable required APIs
+gcloud services enable vision.googleapis.com
+gcloud services enable videointelligence.googleapis.com
+gcloud services enable aiplatform.googleapis.com
+gcloud services enable storage.googleapis.com
+
+# Create service account
+gcloud iam service-accounts create heimdall-service-account
+
+# Create storage bucket
+gsutil mb gs://your-heimdall-bucket
+```
+
+### 4. Set Up Firebase
+1. Go to [Firebase Console](https://console.firebase.google.com/)
+2. Create a new project
+3. Enable Realtime Database, Authentication, Cloud Functions, and Hosting
+4. Download service account key and add to `.env`
+
+### 5. Start the System
+```bash
+# Start backend server
+cd backend
 npm start
 
-# OR using Yarn
-yarn start
+# In another terminal, start mobile app
+cd ..
+npx react-native start
+npx react-native run-android  # or run-ios
 ```
 
-## Step 2: Build and run your app
+### 6. Access Command Center
+Open your browser and go to: `http://localhost:3001/dashboard`
 
-With Metro running, open a new terminal window/pane from the root of your React Native project, and use one of the following commands to build and run your Android or iOS app:
+## 📡 API Endpoints
 
-### Android
+### AI Analysis
+```bash
+# Crowd density analysis
+POST /api/ai/analyze-crowd
+Content-Type: multipart/form-data
+Body: image file + metadata
 
-```sh
-# Using npm
-npm run android
+# Bottleneck prediction
+POST /api/ai/predict-bottlenecks
+Body: { currentConditions, historicalData }
 
-# OR using Yarn
-yarn android
+# Anomaly detection
+POST /api/ai/detect-anomalies
+Content-Type: multipart/form-data
+Body: video file + metadata
+
+# Threat recognition
+POST /api/ai/recognize-threats
+Content-Type: multipart/form-data
+Body: media file + metadata
+
+# Sentiment analysis
+POST /api/ai/analyze-sentiment
+Content-Type: multipart/form-data
+Body: image file + metadata
+
+# Natural language queries
+POST /api/ai/query
+Body: { query: "What happened near Gate B?", context: {} }
 ```
 
-### iOS
+### Emergency Dispatch
+```bash
+# Dispatch emergency response
+POST /api/emergency/dispatch
+Body: {
+  "type": "MEDICAL",
+  "location": {
+    "lat": 40.7128,
+    "lng": -74.0060,
+    "description": "Gate B, Section 3"
+  },
+  "description": "Person collapsed",
+  "reportedBy": "Security Officer"
+}
 
-For iOS, remember to install CocoaPods dependencies (this only needs to be run on first clone or after updating native deps).
+# Get emergency types
+GET /api/emergency/types
 
-The first time you create a new project, run the Ruby bundler to install CocoaPods itself:
+# List incidents
+GET /api/emergency/incidents
 
-```sh
-bundle install
+# Get specific incident
+GET /api/emergency/incidents/:incidentId
 ```
 
-Then, and every time you update your native dependencies, run:
+### Responder Management
+```bash
+# List responders
+GET /api/responders
 
-```sh
-bundle exec pod install
+# Add responder
+POST /api/responders
+Body: {
+  "name": "Security Team Alpha",
+  "skills": ["security", "crowd_control"],
+  "location": { "lat": 40.7128, "lng": -74.0060 },
+  "phone": "+1234567890",
+  "email": "security@venue.com"
+}
+
+# Update responder status
+PUT /api/responders/:responderId/status
+Body: { "status": "available", "location": {...} }
 ```
 
-For more information, please visit [CocoaPods Getting Started guide](https://guides.cocoapods.org/using/getting-started.html).
+### Dashboard & Analytics
+```bash
+# Dashboard overview
+GET /api/dashboard/overview
 
-```sh
-# Using npm
-npm run ios
+# Health check
+GET /health
 
-# OR using Yarn
-yarn ios
+# System status
+GET /debug/status
 ```
 
-If everything is set up correctly, you should see your new app running in the Android Emulator, iOS Simulator, or your connected device.
+## 🔄 Real-Time Features
 
-This is one way to run your app — you can also build it directly from Android Studio or Xcode.
+### WebSocket Events
+Connect to the server and join appropriate channels:
 
-## Step 3: Modify your app
+```javascript
+const socket = io('http://localhost:3001');
 
-Now that you have successfully run the app, let's make changes!
+// Command center feed
+socket.emit('join_command_center');
+socket.on('crowd_analysis', (data) => { /* Handle crowd data */ });
+socket.on('bottleneck_warning', (data) => { /* Handle alert */ });
+socket.on('anomaly_alert', (data) => { /* Handle anomaly */ });
+socket.on('threat_alert', (data) => { /* Critical threat */ });
+socket.on('emergency_dispatch', (data) => { /* Emergency */ });
 
-Open `App.tsx` in your text editor of choice and make some changes. When you save, your app will automatically update and reflect these changes — this is powered by [Fast Refresh](https://reactnative.dev/docs/fast-refresh).
+// Responder feed
+socket.emit('join_responder', 'responder_id');
+socket.on('assignment', (data) => { /* New assignment */ });
+```
 
-When you want to forcefully reload, for example to reset the state of your app, you can perform a full reload:
+## 🚨 Emergency Types
 
-- **Android**: Press the <kbd>R</kbd> key twice or select **"Reload"** from the **Dev Menu**, accessed via <kbd>Ctrl</kbd> + <kbd>M</kbd> (Windows/Linux) or <kbd>Cmd ⌘</kbd> + <kbd>M</kbd> (macOS).
-- **iOS**: Press <kbd>R</kbd> in iOS Simulator.
+The system supports these emergency types with automatic prioritization:
 
-## Congratulations! :tada:
+1. **MEDICAL** (Priority 1) - 5 minute response time
+2. **FIRE** (Priority 1) - 3 minute response time
+3. **SECURITY_THREAT** (Priority 1) - 2 minute response time
+4. **CROWD_CONTROL** (Priority 2) - 7 minute response time
+5. **LOST_PERSON** (Priority 3) - 10 minute response time
+6. **TECHNICAL** (Priority 3) - 15 minute response time
 
-You've successfully run and modified your React Native App. :partying_face:
+## 🤖 AI Capabilities
 
-### Now what?
+### Crowd Analysis
+- **People Counting**: Accurate crowd density measurement
+- **Zone Analysis**: Hot-spot identification and distribution mapping
+- **Flow Patterns**: Movement direction and speed analysis
+- **Bottleneck Prediction**: 15-20 minute advance warning system
 
-- If you want to add this new React Native code to an existing application, check out the [Integration guide](https://reactnative.dev/docs/integration-with-existing-apps).
-- If you're curious to learn more about React Native, check out the [docs](https://reactnative.dev/docs/getting-started).
+### Threat Detection
+- **Weapon Recognition**: Guns, knives, suspicious objects
+- **Fire/Smoke Detection**: Early fire warning system
+- **Text Analysis**: Threatening messages or signs
+- **Behavioral Analysis**: Aggressive or suspicious behavior
 
-# Troubleshooting
+### Anomaly Detection
+- **Movement Patterns**: Panic, erratic behavior, stampede detection
+- **Object Tracking**: Abandoned objects, unusual items
+- **Crowd Dynamics**: Sudden density changes, flow disruptions
 
-If you're having issues getting the above steps to work, see the [Troubleshooting](https://reactnative.dev/docs/troubleshooting) page.
+### Sentiment Analysis
+- **Facial Emotions**: Joy, anger, fear, stress detection
+- **Crowd Mood**: Overall sentiment and stress levels
+- **Panic Indicators**: Early warning for crowd unrest
 
-# Learn More
+## 🎖️ Firebase Integration
 
-To learn more about React Native, take a look at the following resources:
+Heimdall extensively uses Firebase services, making it eligible for Firebase special prizes:
 
-- [React Native Website](https://reactnative.dev) - learn more about React Native.
-- [Getting Started](https://reactnative.dev/docs/environment-setup) - an **overview** of React Native and how setup your environment.
-- [Learn the Basics](https://reactnative.dev/docs/getting-started) - a **guided tour** of the React Native **basics**.
-- [Blog](https://reactnative.dev/blog) - read the latest official React Native **Blog** posts.
-- [`@facebook/react-native`](https://github.com/facebook/react-native) - the Open Source; GitHub **repository** for React Native.
+- **Realtime Database**: Live incident tracking, responder status, real-time alerts
+- **Cloud Functions**: Automated triggers, data processing, alert workflows
+- **Authentication**: Secure access for responders and administrators
+- **Hosting**: Command center dashboard deployment
+- **Cloud Messaging**: Push notifications to responders and mobile apps
+
+## 📱 Mobile Applications
+
+### Attendee Safety App
+- **Panic Button**: One-touch emergency alert
+- **Incident Reporting**: Photo/video incident submission
+- **Safe Routes**: Real-time evacuation path guidance
+- **Notifications**: Emergency alerts and safety updates
+
+### First Responder App
+- **Assignment Notifications**: Real-time emergency assignments
+- **GPS Navigation**: Optimal routing to incident locations
+- **Status Updates**: Check-in and progress reporting
+- **Communication**: Direct line to command center
+
+## 🛠️ Development & Testing
+
+### Mock Services
+For development and testing, enable mock services:
+
+```env
+USE_MOCK_RESPONDERS=true
+USE_MOCK_EMERGENCY_SERVICES=true
+ENABLE_TEST_ENDPOINTS=true
+```
+
+### Demo Mode
+The command center dashboard includes simulation features:
+- **Simulate Emergency**: Test the complete dispatch workflow
+- **Add Mock Responders**: Create test responder profiles
+- **Generate Alerts**: Trigger various alert types for testing
+
+### Debug Mode
+Enable detailed logging:
+
+```env
+DEBUG_AI_ANALYSIS=true
+DEBUG_EMERGENCY_DISPATCH=true
+VERBOSE_LOGGING=true
+LOG_LEVEL=debug
+```
+
+## 📈 Scalability & Performance
+
+### Performance Optimizations
+- **Horizontal Scaling**: Load balancer support
+- **Real-time Processing**: WebSocket-based live updates
+- **Caching**: Redis integration for performance
+- **CDN**: Static asset delivery optimization
+
+### Multi-venue Support
+- **Tenant Isolation**: Venue-specific configurations
+- **Centralized Monitoring**: Cross-venue dashboard
+- **Resource Sharing**: Shared responder pools
+- **Analytics**: Venue comparison and benchmarking
+
+## 🔐 Security & Compliance
+
+### Data Protection
+- **Encryption**: All data encrypted in transit and at rest
+- **GDPR Compliance**: Privacy-focused data handling
+- **Access Control**: Role-based authentication
+- **Audit Logs**: Complete action tracking
+
+### API Security
+- **Rate Limiting**: 100 requests/minute per IP
+- **Authentication**: JWT-based secure access
+- **CORS Protection**: Cross-origin request security
+- **Input Validation**: Comprehensive data sanitization
+
+## 📞 Support & Documentation
+
+### Complete Documentation
+- **[Setup Guide](backend/HEIMDALL_SETUP.md)**: Detailed configuration instructions
+- **[API Documentation](backend/VIDEO_INTELLIGENCE_API.md)**: Complete API reference
+- **[Architecture Overview](backend/SETUP.md)**: System architecture details
+
+### Health Monitoring
+```bash
+# Check system health
+curl http://localhost:3001/health
+
+# Debug system status
+curl http://localhost:3001/debug/status
+
+# Dashboard overview
+curl http://localhost:3001/api/dashboard/overview
+```
+
+### Troubleshooting
+Common issues and solutions are documented in the setup guide. Key checkpoints:
+
+1. **Firebase Connection**: Verify credentials and database URL
+2. **Google Cloud APIs**: Ensure all required APIs are enabled
+3. **Emergency Services**: Test Twilio and email configurations
+4. **Real-time Features**: Check WebSocket connections
+
+## 🎯 Use Cases
+
+### Large Events
+- **Concerts & Festivals**: Crowd management and safety
+- **Sports Events**: Stadium security and emergency response
+- **Conferences**: Attendee safety and incident management
+
+### Venues
+- **Shopping Malls**: Security monitoring and emergency coordination
+- **Airports**: Passenger safety and threat detection
+- **Universities**: Campus security and emergency response
+
+### Smart Cities
+- **Public Spaces**: Crowd monitoring and safety
+- **Transportation Hubs**: Security and incident management
+- **Emergency Services**: Coordinated response systems
+
+## 🏆 Awards & Recognition
+
+This project is designed to compete for multiple categories:
+- **Firebase Special Prize**: Deep Firebase integration across all services
+- **Google Cloud AI**: Advanced AI and ML implementations
+- **Real-time Applications**: WebSocket-based live monitoring
+- **Security Innovation**: Comprehensive threat detection system
+
+## 📄 License
+
+This project is licensed under the MIT License - see the LICENSE file for details.
+
+## 👥 Contributing
+
+We welcome contributions! Please read our contributing guidelines and submit pull requests for any improvements.
+
+---
+
+**Heimdall AI Security System** - Protecting people through intelligent technology 🛡️

@@ -7,14 +7,39 @@ const { Storage } = require('@google-cloud/storage');
 const videoIntelligence = require('@google-cloud/video-intelligence').v1;
 const cors = require('cors');
 const { v4: uuidv4 } = require('uuid');
+const http = require('http');
+const socketIo = require('socket.io');
+
+// Import the new video intelligence API router
+const videoIntelligenceRouter = require('./video-intelligence-api');
+
+// Import new Heimdall services
+const firebase = require('./config/firebase');
+const { 
+  CrowdAnalyzer, 
+  AnomalyDetector, 
+  ThreatRecognizer, 
+  SentimentAnalyzer 
+} = require('./services/ai-analysis');
+const { 
+  EmergencyDispatchSystem, 
+  EMERGENCY_TYPES 
+} = require('./services/emergency-dispatch');
 
 const app = express();
+const server = http.createServer(app);
+const io = socketIo(server, {
+  cors: {
+    origin: "*",
+    methods: ["GET", "POST"]
+  }
+});
 
 // Configuration
 const PORT = process.env.PORT || 3001;
 const TEMP_DIR = path.join(__dirname, 'temp');
 const UPLOADS_DIR = path.join(__dirname, 'uploads');
-const BUCKET_NAME = process.env.GCS_BUCKET_NAME || 'videouploader-heimdall';
+const BUCKET_NAME = process.env.GCS_BUCKET_NAME || 'heimdall-cam';
 const GCLOUD_KEYFILE = path.join(__dirname, process.env.GCLOUD_KEYFILE || 'heimdall-cam.json');
 const GCLOUD_PROJECT_ID = process.env.GCLOUD_PROJECT_ID;
 
@@ -112,6 +137,15 @@ app.use((req, res, next) => {
 });
 
 app.use(express.json());
+app.use(express.static(path.join(__dirname, 'public')));
+
+// Mount the video intelligence API router
+app.use('/api/video-intelligence', videoIntelligenceRouter);
+
+// Serve command center dashboard
+app.get('/dashboard', (req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'command-center.html'));
+});
 
 // Multer configuration for temporary file storage
 const upload = multer({
@@ -260,8 +294,8 @@ async function moveToUploads(tempPath, sessionId, chunkIndex, deviceId = 'unknow
     const sessionDir = path.join(deviceDir, sessionId);
     await fs.mkdir(sessionDir, { recursive: true });
     
-    const timestamp = new Date().toISOString().replace(/:/g, '-').split('.')[0];
-    const fileName = `chunk_${chunkIndex}_${timestamp}.mp4`;
+    const timestamp = Math.floor(Date.now() / 1000);
+    const fileName = `chunk_${timestamp}.mp4`;
     const permanentPath = path.join(sessionDir, fileName);
     
     await fs.copyFile(tempPath, permanentPath);
@@ -284,47 +318,149 @@ async function uploadTempFilesToGCP() {
   try {
     const tempFiles = await fs.readdir(TEMP_DIR);
     const videoFiles = tempFiles.filter(file => 
-      file.endsWith('.mp4') || file.endsWith('.mov') || file.endsWith('.mkv')
+      (file.endsWith('.mp4') || file.endsWith('.mov') || file.endsWith('.mkv')) &&
+      !file.includes('.metadata.json')
     );
 
     if (videoFiles.length === 0) {
       return;
     }
 
-    console.log(`📁 Found ${videoFiles.length} video files in temp directory, uploading to GCP...`);
+    console.log(`📁 Found ${videoFiles.length} video files in temp directory, processing in parallel...`);
 
-    // Upload files in parallel
+    // Process files in parallel like the chunk upload system
     const uploadPromises = videoFiles.map(async (filename) => {
-      const localPath = path.join(TEMP_DIR, filename);
-      const gcsPath = `temp-uploads/${Date.now()}-${filename}`;
+      const videoPath = path.join(TEMP_DIR, filename);
+      const metadataPath = videoPath + '.metadata.json';
       
       try {
-        const result = await uploadToGCPImmediately(localPath, gcsPath, {
-          source: 'temp-directory',
-          originalFilename: filename,
-          foundAt: new Date().toISOString()
-        });
+        // Check if metadata file exists
+        let metadata = {};
+        let uploadId = 'temp-' + Date.now();
+        let sessionId = 'unknown';
+        let deviceId = 'unknown';
+        let chunkIndex = Date.now();
+
+        try {
+          await fs.access(metadataPath);
+          const metadataContent = await fs.readFile(metadataPath, 'utf8');
+          const parsedMetadata = JSON.parse(metadataContent);
+          
+          metadata = parsedMetadata;
+          uploadId = parsedMetadata.uploadId || uploadId;
+          sessionId = parsedMetadata.sessionId || sessionId;
+          deviceId = parsedMetadata.deviceId || deviceId;
+          chunkIndex = parsedMetadata.chunkIndex || chunkIndex;
+          
+          console.log(`📋 Processing chunk [${uploadId}] with metadata for ${filename}`);
+        } catch (metadataError) {
+          console.warn(`⚠️  No metadata found for ${filename}, using defaults`);
+          metadata = {
+            source: 'temp-directory',
+            originalFilename: filename,
+            foundAt: new Date().toISOString(),
+            deviceId,
+            sessionId: 'temp-session'
+          };
+        }
+
+        // Generate GCS path like the chunk upload system
+        const timestamp = Math.floor(Date.now() / 1000);
+        const gcsPath = `devices/${deviceId}/${timestamp}.mp4`;
+        
+        // Upload to GCS with same logic as chunk upload
+        const result = await uploadToGCPImmediately(videoPath, gcsPath, metadata);
 
         if (result.success) {
-          // Clean up local temp file after successful upload
-          await cleanupTempFile(localPath);
-          console.log(`✅ Temp file uploaded and cleaned: ${filename}`);
-          return { filename, success: true, gcsUri: result.gcsUri };
+          // Update session info if session exists
+          if (activeSessions.has(sessionId)) {
+            const session = activeSessions.get(sessionId);
+            const uploadInfo = session.uploads?.find(u => u.uploadId === uploadId);
+            if (uploadInfo) {
+              uploadInfo.gcsUri = result.gcsUri;
+              uploadInfo.presignedUrl = result.presignedUrl;
+              uploadInfo.expiresAt = result.expiresAt;
+              uploadInfo.status = 'completed';
+              uploadInfo.gcsUploadedAt = new Date().toISOString();
+              console.log(`✅ Updated session ${sessionId} with GCS info for chunk ${chunkIndex}`);
+            }
+          }
+
+          // Store analysis results entry
+          analysisResults.set(result.gcsUri, {
+            uploadId,
+            gcsUri: result.gcsUri,
+            sessionId,
+            deviceId,
+            chunkIndex,
+            status: 'pending_analysis',
+            uploadedAt: new Date().toISOString(),
+            metadata
+          });
+
+          // Clean up temp files after successful upload
+          await cleanupTempFile(videoPath);
+          
+          // Clean up metadata file
+          try {
+            await cleanupTempFile(metadataPath);
+          } catch (metaCleanError) {
+            console.warn(`⚠️  Could not clean metadata file: ${metadataPath}`);
+          }
+          
+          console.log(`✅ Temp file uploaded and cleaned: ${filename} → ${result.gcsUri}`);
+          return { 
+            filename, 
+            uploadId,
+            sessionId,
+            deviceId,
+            chunkIndex,
+            success: true, 
+            gcsUri: result.gcsUri,
+            presignedUrl: result.presignedUrl,
+            expiresAt: result.expiresAt,
+            duration: result.duration
+          };
         } else {
           console.log(`❌ Failed to upload temp file: ${filename}`, result.error);
-          return { filename, success: false, error: result.error };
+          return { 
+            filename, 
+            uploadId,
+            sessionId, 
+            success: false, 
+            error: result.error 
+          };
         }
       } catch (error) {
-        console.error(`❌ Error uploading temp file ${filename}:`, error.message);
-        return { filename, success: false, error: error.message };
+        console.error(`❌ Error processing temp file ${filename}:`, error.message);
+        return { 
+          filename, 
+          uploadId: 'error',
+          sessionId: 'unknown',
+          success: false, 
+          error: error.message 
+        };
       }
     });
 
     const results = await Promise.all(uploadPromises);
-    const successful = results.filter(r => r.success).length;
-    const failed = results.filter(r => !r.success).length;
+    const successful = results.filter(r => r.success);
+    const failed = results.filter(r => !r.success);
 
-    console.log(`📊 Temp upload results: ${successful} successful, ${failed} failed`);
+    if (successful.length > 0 || failed.length > 0) {
+      console.log(`📊 Temp upload batch completed: ${successful.length} successful, ${failed.length} failed`);
+      
+      // Log successful uploads with session info
+      successful.forEach(result => {
+        console.log(`   ✅ ${result.filename} → Session: ${result.sessionId}, Chunk: ${result.chunkIndex}, Duration: ${result.duration}ms`);
+      });
+      
+      // Log failed uploads
+      failed.forEach(result => {
+        console.log(`   ❌ ${result.filename} → Error: ${result.error}`);
+      });
+    }
+
     return results;
 
   } catch (error) {
@@ -335,7 +471,7 @@ async function uploadTempFilesToGCP() {
 // Start periodic temp file monitoring
 function startTempFileMonitoring() {
   if (GCS_ENABLED) {
-    console.log('🔄 Starting temp file monitoring (every 30 seconds)');
+    console.log('🔄 Starting temp file monitoring (every 2 seconds)');
     
     // Initial upload
     uploadTempFilesToGCP();
@@ -343,7 +479,7 @@ function startTempFileMonitoring() {
     // Set up periodic monitoring
     setInterval(() => {
       uploadTempFilesToGCP();
-    }, 30000); // Check every 30 seconds
+    }, 2000); // Check every 2 seconds for faster chunk processing
   }
 }
 
@@ -478,9 +614,6 @@ app.post('/upload-chunk', upload.fields([
         const metadataContent = await fs.readFile(metadataFile.path, 'utf8');
         metadata = JSON.parse(metadataContent);
         console.log(`📋 Metadata parsed for upload [${uploadId}]`);
-        
-        // Clean up metadata temp file immediately
-        await cleanupTempFile(metadataFile.path);
       } catch (metadataError) {
         console.warn(`⚠️  Failed to parse metadata for upload [${uploadId}]:`, metadataError.message);
       }
@@ -488,6 +621,7 @@ app.post('/upload-chunk', upload.fields([
 
     const chunkIndex = metadata.chunkIndex || Date.now();
     const sessionId = metadata.sessionId || 'unknown';
+    const deviceId = metadata.deviceId || 'unknown';
     
     console.log(`📹 Processing video chunk [${uploadId}] - Session: ${sessionId}, Chunk: ${chunkIndex}`);
     
@@ -498,64 +632,59 @@ app.post('/upload-chunk', upload.fields([
       session.lastChunkTime = new Date();
     }
 
-    // 1. IMMEDIATE GCP UPLOAD (simultaneous with other operations)
-    const deviceId = metadata.deviceId || 'unknown';
-    const timestamp = new Date().toISOString().replace(/:/g, '-').split('.')[0]; // Clean timestamp
-    const gcsPath = `devices/${deviceId}/sessions/${sessionId}/chunks/chunk_${chunkIndex}_${timestamp}.mp4`;
+    // Save metadata alongside video file in temp for batch processing
+    const metadataPath = videoFile.path + '.metadata.json';
+    await fs.writeFile(metadataPath, JSON.stringify({
+      ...metadata,
+      uploadId,
+      sessionId,
+      chunkIndex,
+      deviceId,
+      timestamp: new Date().toISOString(),
+      originalVideoPath: videoFile.path
+    }));
+
+    // Move to permanent storage immediately (for backup)
+    const permanentPath = await moveToUploads(videoFile.path, sessionId, chunkIndex, deviceId);
     
-    // Start GCP upload immediately (don't await yet)
-    const gcsUploadPromise = uploadToGCPImmediately(videoFile.path, gcsPath, metadata);
-    
-    // 2. SIMULTANEOUSLY move to permanent storage
-    const permanentStoragePromise = moveToUploads(videoFile.path, sessionId, chunkIndex, deviceId);
-    
-    // 3. Wait for both operations to complete
-    const [gcsResult, permanentPath] = await Promise.all([
-      gcsUploadPromise,
-      permanentStoragePromise
-    ]);
-    
-    // 4. Clean up temp file after successful operations
-    await cleanupTempFile(videoFile.path);
-    
-    // 5. Store upload info with presigned URL (no immediate AI analysis)
-    if (gcsResult.success && activeSessions.has(sessionId)) {
+    // Store upload info for session tracking
+    if (activeSessions.has(sessionId)) {
       const session = activeSessions.get(sessionId);
+      session.uploads = session.uploads || [];
       session.uploads.push({
         uploadId,
         chunkIndex,
-        gcsUri: gcsResult.gcsUri,
-        presignedUrl: gcsResult.presignedUrl,
-        expiresAt: gcsResult.expiresAt,
+        tempPath: videoFile.path,
         localPath: permanentPath,
-        analysisStatus: 'pending', // Ready for later analysis
+        metadataPath,
+        status: 'pending_gcs_upload',
         timestamp: new Date()
       });
     }
-    
+
     const totalDuration = Date.now() - startTime;
     
-    console.log(`✅ Upload [${uploadId}] completed in ${totalDuration}ms`);
-    console.log(`   📤 GCS Upload: ${gcsResult.success ? '✅' : '❌'} (${gcsResult.duration || 0}ms)`);
+    console.log(`✅ Upload [${uploadId}] queued for GCS upload in ${totalDuration}ms`);
     console.log(`   📁 Local Storage: ✅`);
-    console.log(`   🔗 Presigned URL: ${gcsResult.success ? '✅ 48h validity' : '❌'}`);
+    console.log(`   📋 Metadata Saved: ✅`);
+    console.log(`   ⏳ GCS Upload: Queued for batch processing`);
 
-    // Send response with presigned URL for immediate access
+    // Clean up metadata temp file from multer
+    if (metadataFile) {
+      await cleanupTempFile(metadataFile.path);
+    }
+
+    // Send response immediately - GCS upload will happen via temp monitoring
     res.json({
       success: true,
       uploadId,
       sessionId,
       chunkIndex,
-      gcsUpload: {
-        success: gcsResult.success,
-        gcsUri: gcsResult.gcsUri,
-        presignedUrl: gcsResult.presignedUrl,
-        expiresAt: gcsResult.expiresAt
-      },
       localPath: permanentPath,
       processingTime: totalDuration,
       timestamp: new Date().toISOString(),
-      message: 'Video chunk uploaded successfully with 48h access URL'
+      message: 'Video chunk received, GCS upload in progress',
+      status: 'pending_gcs_upload'
     });
 
   } catch (error) {
@@ -584,6 +713,48 @@ app.get('/session/:sessionId', (req, res) => {
         ...session,
         uploads: session.uploads || []
       }
+    });
+  } else {
+    res.status(404).json({
+      success: false,
+      error: 'Session not found'
+    });
+  }
+});
+
+// Get upload status for a session
+app.get('/session/:sessionId/upload-status', (req, res) => {
+  const { sessionId } = req.params;
+  
+  if (activeSessions.has(sessionId)) {
+    const session = activeSessions.get(sessionId);
+    const uploads = session.uploads || [];
+    
+    const uploadStats = {
+      total: uploads.length,
+      completed: uploads.filter(u => u.status === 'completed').length,
+      pending: uploads.filter(u => u.status === 'pending_gcs_upload').length,
+      failed: uploads.filter(u => u.status === 'failed').length
+    };
+    
+    const completedUploads = uploads
+      .filter(u => u.status === 'completed')
+      .map(u => ({
+        uploadId: u.uploadId,
+        chunkIndex: u.chunkIndex,
+        gcsUri: u.gcsUri,
+        presignedUrl: u.presignedUrl,
+        expiresAt: u.expiresAt,
+        gcsUploadedAt: u.gcsUploadedAt
+      }));
+    
+    res.json({
+      success: true,
+      sessionId,
+      uploadStats,
+      completedUploads,
+      allCompleted: uploadStats.pending === 0,
+      timestamp: new Date().toISOString()
     });
   } else {
     res.status(404).json({
@@ -1023,15 +1194,663 @@ app.get('/debug/status', (req, res) => {
     activeSessions: activeSessions.size,
     services: {
       gcs: GCS_ENABLED,
-      videoAI: VIDEO_AI_ENABLED
+      videoAI: VIDEO_AI_ENABLED,
+      firebase: firebase.isInitialized
     },
     directories: {
       temp: TEMP_DIR,
       uploads: UPLOADS_DIR
     },
-    server: 'Heimdall Backend v3.0'
+    server: 'Heimdall Security System v3.0'
   });
 });
+
+// Debug endpoint for temp directory and upload status
+app.get('/debug/temp-status', async (req, res) => {
+  try {
+    const tempFiles = await fs.readdir(TEMP_DIR);
+    const videoFiles = tempFiles.filter(file => 
+      (file.endsWith('.mp4') || file.endsWith('.mov') || file.endsWith('.mkv')) &&
+      !file.includes('.metadata.json')
+    );
+    const metadataFiles = tempFiles.filter(file => file.includes('.metadata.json'));
+    
+    // Get pending uploads from all sessions
+    const allSessions = Array.from(activeSessions.values());
+    const pendingUploads = allSessions.reduce((acc, session) => {
+      const pending = (session.uploads || []).filter(u => u.status === 'pending_gcs_upload');
+      return acc.concat(pending.map(u => ({
+        sessionId: session.sessionId,
+        uploadId: u.uploadId,
+        chunkIndex: u.chunkIndex,
+        tempPath: u.tempPath
+      })));
+    }, []);
+    
+    res.json({
+      timestamp: new Date(),
+      tempDirectory: {
+        path: TEMP_DIR,
+        videoFiles: videoFiles.length,
+        metadataFiles: metadataFiles.length,
+        videoFilesList: videoFiles,
+        metadataFilesList: metadataFiles
+      },
+      uploadStatus: {
+        pendingGcsUploads: pendingUploads.length,
+        pendingUploadsList: pendingUploads
+      },
+      services: {
+        gcs: GCS_ENABLED,
+        tempMonitoring: GCS_ENABLED ? 'Active (2s intervals)' : 'Disabled'
+      }
+    });
+  } catch (error) {
+    res.status(500).json({
+      timestamp: new Date(),
+      error: error.message,
+      tempDirectory: TEMP_DIR
+    });
+  }
+});
+
+// ==============================================
+// HEIMDALL AI SECURITY SYSTEM API ENDPOINTS
+// ==============================================
+
+// Socket.IO real-time communication
+io.on('connection', (socket) => {
+  console.log('📡 Client connected to real-time feed:', socket.id);
+  
+  socket.on('join_command_center', () => {
+    socket.join('command_center');
+    console.log('🎯 Client joined command center feed');
+  });
+
+  socket.on('join_responder', (responderId) => {
+    socket.join(`responder_${responderId}`);
+    console.log(`👮 Responder ${responderId} joined feed`);
+  });
+
+  socket.on('disconnect', () => {
+    console.log('📡 Client disconnected:', socket.id);
+  });
+});
+
+// Crowd Analysis Endpoints
+app.post('/api/ai/analyze-crowd', upload.single('image'), async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({
+        success: false,
+        error: 'No image file provided'
+      });
+    }
+
+    const imageBuffer = await fs.readFile(req.file.path);
+    const metadata = req.body.metadata ? JSON.parse(req.body.metadata) : {};
+
+    const analysis = await CrowdAnalyzer.analyzeCrowdDensity(imageBuffer, metadata);
+    
+    // Clean up temp file
+    await fs.unlink(req.file.path);
+
+    // Emit real-time update
+    io.to('command_center').emit('crowd_analysis', analysis);
+
+    res.json({
+      success: true,
+      analysis,
+      timestamp: new Date().toISOString()
+    });
+
+  } catch (error) {
+    console.error('❌ Crowd analysis failed:', error.message);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+app.post('/api/ai/predict-bottlenecks', async (req, res) => {
+  try {
+    const { currentConditions, historicalData } = req.body;
+
+    if (!currentConditions) {
+      return res.status(400).json({
+        success: false,
+        error: 'Current conditions data required'
+      });
+    }
+
+    const prediction = await CrowdAnalyzer.predictBottlenecks(historicalData || [], currentConditions);
+    
+    // Emit real-time alert if high risk
+    if (prediction.riskLevel === 'high') {
+      io.to('command_center').emit('bottleneck_warning', prediction);
+    }
+
+    res.json({
+      success: true,
+      prediction,
+      timestamp: new Date().toISOString()
+    });
+
+  } catch (error) {
+    console.error('❌ Bottleneck prediction failed:', error.message);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+// Anomaly Detection Endpoints
+app.post('/api/ai/detect-anomalies', upload.single('video'), async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({
+        success: false,
+        error: 'No video file provided'
+      });
+    }
+
+    const videoBuffer = await fs.readFile(req.file.path);
+    const metadata = req.body.metadata ? JSON.parse(req.body.metadata) : {};
+
+    const analysis = await AnomalyDetector.detectAnomalies(videoBuffer, metadata);
+    
+    // Clean up temp file
+    await fs.unlink(req.file.path);
+
+    // Emit real-time alert for anomalies
+    if (analysis.severity === 'high' || analysis.severity === 'critical') {
+      io.to('command_center').emit('anomaly_alert', analysis);
+    }
+
+    res.json({
+      success: true,
+      analysis,
+      timestamp: new Date().toISOString()
+    });
+
+  } catch (error) {
+    console.error('❌ Anomaly detection failed:', error.message);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+// Threat Recognition Endpoints
+app.post('/api/ai/recognize-threats', upload.single('media'), async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({
+        success: false,
+        error: 'No media file provided'
+      });
+    }
+
+    const mediaBuffer = await fs.readFile(req.file.path);
+    const mediaType = req.body.mediaType || 'image';
+    const metadata = req.body.metadata ? JSON.parse(req.body.metadata) : {};
+
+    const analysis = await ThreatRecognizer.recognizeThreats(mediaBuffer, mediaType, metadata);
+    
+    // Clean up temp file
+    await fs.unlink(req.file.path);
+
+    // Emit critical threat alerts immediately
+    if (analysis.threatLevel === 'critical') {
+      io.to('command_center').emit('threat_alert', analysis);
+      
+      // Auto-dispatch emergency response for critical threats
+      if (analysis.threats.some(t => t.type === 'WEAPON_DETECTED' || t.type === 'FIRE_SMOKE_DETECTED')) {
+        const emergencyType = analysis.threats.some(t => t.type === 'WEAPON_DETECTED') ? 'SECURITY_THREAT' : 'FIRE';
+        
+        try {
+          await EmergencyDispatchSystem.dispatchEmergency({
+            type: emergencyType,
+            location: metadata.location || { lat: 40.7128, lng: -74.0060, description: 'Unknown location' },
+            description: `Auto-dispatched due to threat detection: ${analysis.threats.map(t => t.description).join(', ')}`,
+            reportedBy: 'AI_THREAT_DETECTION',
+            metadata: { threatAnalysis: analysis }
+          });
+        } catch (dispatchError) {
+          console.error('❌ Auto-dispatch failed:', dispatchError.message);
+        }
+      }
+    }
+
+    res.json({
+      success: true,
+      analysis,
+      timestamp: new Date().toISOString()
+    });
+
+  } catch (error) {
+    console.error('❌ Threat recognition failed:', error.message);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+// Sentiment Analysis Endpoints
+app.post('/api/ai/analyze-sentiment', upload.single('image'), async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({
+        success: false,
+        error: 'No image file provided'
+      });
+    }
+
+    const imageBuffer = await fs.readFile(req.file.path);
+    const metadata = req.body.metadata ? JSON.parse(req.body.metadata) : {};
+
+    const analysis = await SentimentAnalyzer.analyzeCrowdSentiment(imageBuffer, metadata);
+    
+    // Clean up temp file
+    await fs.unlink(req.file.path);
+
+    // Emit stress alerts
+    if (analysis.stressLevel === 'high') {
+      io.to('command_center').emit('stress_alert', analysis);
+    }
+
+    res.json({
+      success: true,
+      analysis,
+      timestamp: new Date().toISOString()
+    });
+
+  } catch (error) {
+    console.error('❌ Sentiment analysis failed:', error.message);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+// Emergency Dispatch Endpoints
+app.post('/api/emergency/dispatch', async (req, res) => {
+  try {
+    const incident = req.body;
+
+    if (!incident.type || !EMERGENCY_TYPES[incident.type]) {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid or missing emergency type',
+        validTypes: Object.keys(EMERGENCY_TYPES)
+      });
+    }
+
+    const result = await EmergencyDispatchSystem.dispatchEmergency(incident);
+    
+    // Emit real-time update to command center
+    io.to('command_center').emit('emergency_dispatch', result);
+
+    // Notify assigned responders
+    if (result.assignments) {
+      result.assignments.forEach(assignment => {
+        io.to(`responder_${assignment.responderId}`).emit('assignment', {
+          incident,
+          assignment,
+          timestamp: new Date().toISOString()
+        });
+      });
+    }
+
+    res.json(result);
+
+  } catch (error) {
+    console.error('❌ Emergency dispatch failed:', error.message);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+app.get('/api/emergency/types', (req, res) => {
+  res.json({
+    success: true,
+    emergencyTypes: EMERGENCY_TYPES,
+    timestamp: new Date().toISOString()
+  });
+});
+
+app.get('/api/emergency/incidents', async (req, res) => {
+  try {
+    if (!firebase.db) {
+      return res.status(503).json({
+        success: false,
+        error: 'Firebase not available'
+      });
+    }
+
+    const snapshot = await firebase.db.ref('incidents').once('value');
+    const incidents = snapshot.val() || {};
+
+    const incidentList = Object.values(incidents).sort((a, b) => 
+      new Date(b.timestamp) - new Date(a.timestamp)
+    );
+
+    res.json({
+      success: true,
+      incidents: incidentList,
+      total: incidentList.length,
+      timestamp: new Date().toISOString()
+    });
+
+  } catch (error) {
+    console.error('❌ Failed to get incidents:', error.message);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+app.get('/api/emergency/incidents/:incidentId', async (req, res) => {
+  try {
+    const { incidentId } = req.params;
+    
+    if (!firebase.db) {
+      return res.status(503).json({
+        success: false,
+        error: 'Firebase not available'
+      });
+    }
+
+    const snapshot = await firebase.db.ref(`incidents/${incidentId}`).once('value');
+    const incident = snapshot.val();
+
+    if (!incident) {
+      return res.status(404).json({
+        success: false,
+        error: 'Incident not found'
+      });
+    }
+
+    res.json({
+      success: true,
+      incident,
+      timestamp: new Date().toISOString()
+    });
+
+  } catch (error) {
+    console.error('❌ Failed to get incident:', error.message);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+// Responder Management
+app.get('/api/responders', async (req, res) => {
+  try {
+    if (!firebase.db) {
+      return res.status(503).json({
+        success: false,
+        error: 'Firebase not available'
+      });
+    }
+
+    const snapshot = await firebase.db.ref('responders').once('value');
+    const responders = snapshot.val() || {};
+
+    res.json({
+      success: true,
+      responders: Object.entries(responders).map(([id, data]) => ({ id, ...data })),
+      total: Object.keys(responders).length,
+      timestamp: new Date().toISOString()
+    });
+
+  } catch (error) {
+    console.error('❌ Failed to get responders:', error.message);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+app.post('/api/responders', async (req, res) => {
+  try {
+    const responder = req.body;
+    
+    if (!firebase.db) {
+      return res.status(503).json({
+        success: false,
+        error: 'Firebase not available'
+      });
+    }
+
+    const responderId = responder.id || uuidv4();
+    const responderData = {
+      ...responder,
+      id: responderId,
+      status: responder.status || 'available',
+      createdAt: new Date().toISOString(),
+      lastUpdated: new Date().toISOString()
+    };
+
+    await firebase.db.ref(`responders/${responderId}`).set(responderData);
+
+    res.json({
+      success: true,
+      responder: responderData,
+      timestamp: new Date().toISOString()
+    });
+
+  } catch (error) {
+    console.error('❌ Failed to create responder:', error.message);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+app.put('/api/responders/:responderId/status', async (req, res) => {
+  try {
+    const { responderId } = req.params;
+    const { status, location } = req.body;
+    
+    if (!firebase.db) {
+      return res.status(503).json({
+        success: false,
+        error: 'Firebase not available'
+      });
+    }
+
+    const updates = {
+      status,
+      lastUpdated: new Date().toISOString()
+    };
+
+    if (location) {
+      updates.location = location;
+    }
+
+    await firebase.db.ref(`responders/${responderId}`).update(updates);
+
+    // Emit real-time update
+    io.to('command_center').emit('responder_status_update', {
+      responderId,
+      status,
+      location,
+      timestamp: new Date().toISOString()
+    });
+
+    res.json({
+      success: true,
+      responderId,
+      updates,
+      timestamp: new Date().toISOString()
+    });
+
+  } catch (error) {
+    console.error('❌ Failed to update responder status:', error.message);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+// Real-time Analytics Dashboard
+app.get('/api/dashboard/overview', async (req, res) => {
+  try {
+    const overview = {
+      timestamp: new Date().toISOString(),
+      activeSessions: activeSessions.size,
+      services: {
+        gcs: GCS_ENABLED,
+        videoAI: VIDEO_AI_ENABLED,
+        firebase: firebase.isInitialized,
+        realtime: true
+      }
+    };
+
+    // Get incident statistics
+    if (firebase.db) {
+      try {
+        const [incidentsSnapshot, respondersSnapshot] = await Promise.all([
+          firebase.db.ref('incidents').once('value'),
+          firebase.db.ref('responders').once('value')
+        ]);
+
+        const incidents = incidentsSnapshot.val() || {};
+        const responders = respondersSnapshot.val() || {};
+
+        overview.incidents = {
+          total: Object.keys(incidents).length,
+          active: Object.values(incidents).filter(i => i.status === 'RESPONDING' || i.status === 'DISPATCHING').length,
+          resolved: Object.values(incidents).filter(i => i.status === 'RESOLVED').length
+        };
+
+        overview.responders = {
+          total: Object.keys(responders).length,
+          available: Object.values(responders).filter(r => r.status === 'available').length,
+          dispatched: Object.values(responders).filter(r => r.status === 'dispatched').length,
+          offline: Object.values(responders).filter(r => r.status === 'offline').length
+        };
+      } catch (dbError) {
+        console.warn('⚠️  Database stats unavailable:', dbError.message);
+      }
+    }
+
+    res.json({
+      success: true,
+      overview,
+      timestamp: new Date().toISOString()
+    });
+
+  } catch (error) {
+    console.error('❌ Failed to get dashboard overview:', error.message);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+// AI-Powered Query Endpoint (Gemini integration placeholder)
+app.post('/api/ai/query', async (req, res) => {
+  try {
+    const { query, context } = req.body;
+
+    if (!query) {
+      return res.status(400).json({
+        success: false,
+        error: 'Query is required'
+      });
+    }
+
+    // For now, return a structured response based on query patterns
+    // In production, this would integrate with Gemini for natural language processing
+    const response = await processNaturalLanguageQuery(query, context);
+
+    res.json({
+      success: true,
+      query,
+      response,
+      timestamp: new Date().toISOString()
+    });
+
+  } catch (error) {
+    console.error('❌ AI query failed:', error.message);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+// Simple natural language query processor (placeholder for Gemini)
+async function processNaturalLanguageQuery(query, context) {
+  const lowercaseQuery = query.toLowerCase();
+
+  // Incident-related queries
+  if (lowercaseQuery.includes('what happened') || lowercaseQuery.includes('incident')) {
+    if (firebase.db) {
+      const snapshot = await firebase.db.ref('incidents').orderByChild('timestamp').limitToLast(5).once('value');
+      const recentIncidents = Object.values(snapshot.val() || {});
+      
+      return {
+        type: 'incident_summary',
+        summary: `Recent incidents: ${recentIncidents.map(i => `${i.type} at ${i.location?.description || 'unknown location'}`).join(', ')}`,
+        incidents: recentIncidents
+      };
+    }
+  }
+
+  // Crowd density queries
+  if (lowercaseQuery.includes('crowd') || lowercaseQuery.includes('density')) {
+    return {
+      type: 'crowd_status',
+      summary: 'Crowd analysis data would be retrieved from recent analytics',
+      suggestion: 'Use the crowd analysis endpoint to get real-time density data'
+    };
+  }
+
+  // Responder queries
+  if (lowercaseQuery.includes('responder') || lowercaseQuery.includes('security')) {
+    if (firebase.db) {
+      const snapshot = await firebase.db.ref('responders').once('value');
+      const responders = Object.values(snapshot.val() || {});
+      const available = responders.filter(r => r.status === 'available').length;
+      
+      return {
+        type: 'responder_status',
+        summary: `${available} of ${responders.length} responders are currently available`,
+        responders: responders
+      };
+    }
+  }
+
+  // Default response
+  return {
+    type: 'general',
+    summary: 'I can help you with information about incidents, crowd analysis, responder status, and security alerts. Please ask specific questions about these topics.',
+    capabilities: [
+      'Recent incident reports',
+      'Crowd density analysis',
+      'Responder availability',
+      'Security threat status',
+      'Emergency response coordination'
+    ]
+  };
+}
 
 // Initialize and start server
 async function startServer() {
@@ -1043,17 +1862,24 @@ async function startServer() {
   // Start temp file monitoring
   startTempFileMonitoring();
   
-  // Start the server
-  app.listen(PORT, () => {
-    console.log(`✅ Heimdall Backend v3.0 running on port ${PORT}`);
-    console.log(`🌐 Ready to process video uploads`);
+  // Start the server with Socket.IO
+  server.listen(PORT, () => {
+    console.log(`✅ Heimdall Security System v3.0 running on port ${PORT}`);
+    console.log(`🌐 Ready for AI-powered security monitoring`);
     console.log(`🔧 Services Status:`);
     console.log(`   🪣 GCS Upload: ${GCS_ENABLED ? '✅ Enabled' : '❌ Disabled'}`);
-    console.log(`   🤖 Video AI: ${VIDEO_AI_ENABLED ? '✅ Enabled (Separate Analysis)' : '❌ Disabled'}`);
+    console.log(`   🤖 Video AI: ${VIDEO_AI_ENABLED ? '✅ Enabled' : '❌ Disabled'}`);
+    console.log(`   🔥 Firebase: ${firebase.isInitialized ? '✅ Enabled' : '❌ Disabled'}`);
+    console.log(`   📡 Real-time: ✅ Socket.IO Active`);
+    console.log(`   🚨 Emergency Dispatch: ✅ Ready`);
+    console.log(`   🤖 AI Analysis: ✅ Crowd, Threat, Anomaly, Sentiment`);
     console.log(`   📁 Temp Directory: ${TEMP_DIR}`);
     console.log(`   📁 Uploads Directory: ${UPLOADS_DIR}`);
     console.log(`   🔗 Presigned URLs: 48-hour validity`);
-    console.log(`   🔄 Temp Monitoring: ${GCS_ENABLED ? '✅ Active (30s intervals)' : '❌ Disabled'}`);
+    console.log(`   🔄 Temp Monitoring: ${GCS_ENABLED ? '✅ Active (2s intervals)' : '❌ Disabled'}`);
+    console.log(`📡 WebSocket server ready for real-time communication`);
+    console.log(`🎯 Command center: Connect and emit 'join_command_center'`);
+    console.log(`👮 Responders: Connect and emit 'join_responder' with ID`);
   });
 }
 
