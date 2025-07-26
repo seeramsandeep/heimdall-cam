@@ -13,6 +13,9 @@ const socketIo = require('socket.io');
 // Import the new video intelligence API router
 const videoIntelligenceRouter = require('./video-intelligence-api');
 
+// Import detections API router
+const detectionsRouter = require('./services/detections-api');
+
 // Import new Heimdall services
 const firebase = require('./config/firebase');
 const { 
@@ -142,6 +145,9 @@ app.use(express.static(path.join(__dirname, 'public')));
 // Mount the video intelligence API router
 app.use('/api/video-intelligence', videoIntelligenceRouter);
 
+// Mount the detections API router
+app.use('/api', detectionsRouter);
+
 // Serve command center dashboard
 app.get('/dashboard', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'command-center.html'));
@@ -169,6 +175,11 @@ const upload = multer({
 const activeSessions = new Map();
 const uploadQueue = new Map(); // Track upload status
 const analysisResults = new Map(); // Store analysis results by gcsUri
+
+// Rate limiting for Video Intelligence API
+let analysisQueue = [];
+let isProcessingQueue = false;
+const RATE_LIMIT_DELAY = 1100; // 1.1 seconds between requests (allows ~54 requests per minute)
 
 // Immediate GCP upload function with presigned URL generation
 async function uploadToGCPImmediately(localFilePath, gcsPath, metadata = {}) {
@@ -228,53 +239,105 @@ async function uploadToGCPImmediately(localFilePath, gcsPath, metadata = {}) {
   }
 }
 
-// Process video for AI analysis
+// Process video for AI analysis with rate limiting
 async function processVideoAnalysis(gcsUri, metadata) {
   if (!VIDEO_AI_ENABLED) {
     console.log('⚠️  Video AI disabled, skipping analysis for:', gcsUri);
     return null;
   }
 
-  try {
-    console.log(`🤖 Starting AI analysis for: ${gcsUri}`);
-    
-    const request = {
-      inputUri: gcsUri,
-      features: [
-        'LABEL_DETECTION',
-        'PERSON_DETECTION',
-        'OBJECT_TRACKING',
-        'TEXT_DETECTION',
-      ],
-      videoContext: {
-        personDetectionConfig: {
-          includeBoundingBoxes: true,
-          includeAttributes: true,
-        },
-        labelDetectionConfig: {
-          model: 'builtin/latest',
-        },
-      },
-    };
+  return new Promise((resolve) => {
+    // Add to queue
+    analysisQueue.push({
+      gcsUri,
+      metadata,
+      resolve
+    });
 
-    const [operation] = await videoClient.annotateVideo(request);
-    const [result] = await operation.promise();
-    
-    console.log(`✅ AI analysis completed for: ${gcsUri}`);
-    return {
-      ...result.annotationResults[0],
-      processedAt: new Date().toISOString(),
-      metadata
-    };
+    // Start processing if not already running
+    if (!isProcessingQueue) {
+      processQueue();
+    }
+  });
+}
 
-  } catch (error) {
-    console.error(`❌ AI analysis failed for ${gcsUri}:`, error.message);
-    return {
-      error: error.message,
-      processedAt: new Date().toISOString(),
-      metadata
-    };
+// Process the analysis queue with rate limiting
+async function processQueue() {
+  if (isProcessingQueue || analysisQueue.length === 0) {
+    return;
   }
+
+  isProcessingQueue = true;
+  console.log(`🔄 Processing analysis queue (${analysisQueue.length} items remaining)`);
+
+  while (analysisQueue.length > 0) {
+    const { gcsUri, metadata, resolve } = analysisQueue.shift();
+
+    try {
+      console.log(`🤖 Starting AI analysis for: ${gcsUri}`);
+      
+      const request = {
+        inputUri: gcsUri,
+        features: [
+          'LABEL_DETECTION',
+          'PERSON_DETECTION',
+          'OBJECT_TRACKING',
+          'TEXT_DETECTION',
+        ],
+        videoContext: {
+          personDetectionConfig: {
+            includeBoundingBoxes: true,
+            includeAttributes: true,
+          },
+          labelDetectionConfig: {
+            model: 'builtin/latest',
+          },
+        },
+      };
+
+      const [operation] = await videoClient.annotateVideo(request);
+      const [result] = await operation.promise();
+      
+      console.log(`✅ AI analysis completed for: ${gcsUri}`);
+      const analysisResult = {
+        ...result.annotationResults[0],
+        processedAt: new Date().toISOString(),
+        metadata
+      };
+      
+      resolve(analysisResult);
+
+    } catch (error) {
+      console.error(`❌ AI analysis failed for ${gcsUri}:`, error.message);
+      
+      // If it's a rate limit error, put it back in the queue
+      if (error.message.includes('RESOURCE_EXHAUSTED') || error.message.includes('RATE_LIMIT_EXCEEDED')) {
+        console.log(`⏳ Rate limit hit, re-queuing ${gcsUri} for retry`);
+        analysisQueue.unshift({ gcsUri, metadata, resolve });
+        
+        // Wait longer before retrying
+        await new Promise(resolve => setTimeout(resolve, 5000));
+        continue;
+      }
+      
+      const errorResult = {
+        error: error.message,
+        processedAt: new Date().toISOString(),
+        metadata
+      };
+      
+      resolve(errorResult);
+    }
+
+    // Rate limiting delay between requests
+    if (analysisQueue.length > 0) {
+      console.log(`⏳ Rate limiting: waiting ${RATE_LIMIT_DELAY}ms before next request`);
+      await new Promise(resolve => setTimeout(resolve, RATE_LIMIT_DELAY));
+    }
+  }
+
+  isProcessingQueue = false;
+  console.log('✅ Analysis queue processing completed');
 }
 
 // Clean up local temp file after processing
@@ -725,84 +788,131 @@ app.post('/upload-chunk', upload.fields([
   }
 });
 
-// Get session status
-app.get('/session/:sessionId', (req, res) => {
-  const { sessionId } = req.params;
-  
-  if (activeSessions.has(sessionId)) {
-    const session = activeSessions.get(sessionId);
-    res.json({
-      success: true,
-      session: {
-        ...session,
-        uploads: session.uploads || []
-      }
-    });
-  } else {
-    res.status(404).json({
-      success: false,
-      error: 'Session not found'
-    });
+
+// Live Chunks
+app.get('/live-chunks/:deviceId', async (req, res) => {
+  const { deviceId } = req.params;
+  const prefix = `devices/${deviceId}/`;
+
+  try {
+    if (!GCS_ENABLED || !storage) {
+      return res.status(503).json({ 
+        error: 'GCS not enabled or storage not initialized',
+        gcsEnabled: GCS_ENABLED,
+        storageInitialized: !!storage
+      });
+    }
+
+    const bucket = storage.bucket(BUCKET_NAME);
+    const [files] = await bucket.getFiles({ prefix });
+
+    const videoChunks = files
+      .filter(f => f.name.endsWith('.mp4'))
+      .sort((a, b) => {
+        const tsA = parseInt(a.name.split('/').pop().split('.')[0]);
+        const tsB = parseInt(b.name.split('/').pop().split('.')[0]);
+        return tsA - tsB;
+      })
+      .slice(-6); // Get last 6 chunks (≈ 1 min)
+
+    const urls = await Promise.all(videoChunks.map(async file => {
+      const [url] = await file.getSignedUrl({
+        action: 'read',
+        expires: Date.now() + 5 * 60 * 1000
+      });
+      return url;
+    }));
+
+    res.json(urls);
+
+  } catch (err) {
+    console.error(`❌ Failed to fetch chunks:`, err.message);
+    res.status(500).json({ error: 'Failed to fetch live chunks' });
   }
 });
 
-// Get upload status for a session
-app.get('/session/:sessionId/upload-status', (req, res) => {
-  const { sessionId } = req.params;
-  
-  if (activeSessions.has(sessionId)) {
-    const session = activeSessions.get(sessionId);
-    const uploads = session.uploads || [];
-    
-    const uploadStats = {
-      total: uploads.length,
-      completed: uploads.filter(u => u.status === 'completed').length,
-      pending: uploads.filter(u => u.status === 'pending_gcs_upload').length,
-      failed: uploads.filter(u => u.status === 'failed').length
-    };
-    
-    const completedUploads = uploads
-      .filter(u => u.status === 'completed')
-      .map(u => ({
-        uploadId: u.uploadId,
-        chunkIndex: u.chunkIndex,
-        gcsUri: u.gcsUri,
-        presignedUrl: u.presignedUrl,
-        expiresAt: u.expiresAt,
-        gcsUploadedAt: u.gcsUploadedAt
-      }));
-    
-    res.json({
-      success: true,
-      sessionId,
-      uploadStats,
-      completedUploads,
-      allCompleted: uploadStats.pending === 0,
-      timestamp: new Date().toISOString()
-    });
-  } else {
-    res.status(404).json({
-      success: false,
-      error: 'Session not found'
-    });
+
+// // List all uploaded videos with pres-signed urls
+// app.get('/videos', async (req, res) => {
+//   try {
+//     if (!GCS_ENABLED) {
+//       return res.status(503).json({
+//         success: false,
+//         error: 'GCS not enabled'
+//       });
+//     }
+
+//     const bucket = storage.bucket(BUCKET_NAME);
+//     const [files] = await bucket.getFiles({
+//       prefix: 'devices/', // Get all video files under devices/
+//     });
+
+//     const videos = await Promise.all(
+//       files
+//         .filter(file => file.name.endsWith('.mp4') || file.name.endsWith('.mov') || file.name.endsWith('.mkv') || file.name.endsWith('.webm'))
+//         .map(async (file) => {
+//           try {
+//             const [metadata] = await file.getMetadata();
+            
+//             // Generate new presigned URL (48 hours)
+//             const [presignedUrl] = await file.getSignedUrl({
+//               action: 'read',
+//               expires: Date.now() + 48 * 60 * 60 * 1000,
+//             });
+
+//             const gcsUri = `gs://${BUCKET_NAME}/${file.name}`;
+//             const analysisData = analysisResults.get(gcsUri);
+
+//             return {
+//               filename: file.name,
+//               gcsUri,
+//               presignedUrl,
+//               expiresAt: new Date(Date.now() + 48 * 60 * 60 * 1000).toISOString(),
+//               size: metadata.size,
+//               created: metadata.timeCreated,
+//               updated: metadata.updated,
+//               analysisStatus: analysisData ? (analysisData.status === 'failed' ? 'failed' : 'completed') : 'pending',
+//               analysisCompletedAt: analysisData?.completedAt,
+//               deviceId: metadata.metadata?.deviceId || 'unknown',
+//               sessionId: file.name.split('/')[2] || 'unknown', // Extract from path
+//               chunkIndex: metadata.metadata?.chunkIndex || 'unknown'
+//             };
+//           } catch (error) {
+//             console.warn(`⚠️  Could not get metadata for ${file.name}:`, error.message);
+//             return {
+//               filename: file.name,
+//               gcsUri: `gs://${BUCKET_NAME}/${file.name}`,
+//               error: 'Metadata unavailable'
+//             };
+//           }
+//         })
+//     );
+
+//     res.json({
+//       success: true,
+//       videos: videos.filter(v => !v.error), // Only return successful ones
+//       total: videos.filter(v => !v.error).length,
+//       timestamp: new Date().toISOString()
+//     });
+
+//   } catch (error) {
+//     console.error('❌ Error listing videos:', error.message);
+//     res.status(500).json({
+//       success: false,
+//       error: error.message
+//     });
+//   }
+// });
+
+
+function sortGroupedVideosByTime(groupedVideos) {
+  for (const deviceId in groupedVideos) {
+    groupedVideos[deviceId].sort((a, b) => new Date(a.startTime) - new Date(b.startTime));
   }
-});
+  return groupedVideos;
+}
 
-// List all sessions
-app.get('/sessions', (req, res) => {
-  const sessions = Array.from(activeSessions.entries()).map(([id, session]) => ({
-    sessionId: id,
-    ...session
-  }));
-  
-  res.json({
-    success: true,
-    sessions,
-    total: sessions.length
-  });
-});
-
-// List all uploaded videos
+// List all uploaded videos, grouped by device, sorted by startTime, with public URL
 app.get('/videos', async (req, res) => {
   try {
     if (!GCS_ENABLED) {
@@ -813,57 +923,46 @@ app.get('/videos', async (req, res) => {
     }
 
     const bucket = storage.bucket(BUCKET_NAME);
-    const [files] = await bucket.getFiles({
-      prefix: 'devices/', // Get all video files under devices/
-    });
+    const [files] = await bucket.getFiles({ prefix: 'devices/' });
 
-    const videos = await Promise.all(
+    const groupedVideos = {};
+
+    await Promise.all(
       files
-        .filter(file => file.name.endsWith('.mp4') || file.name.endsWith('.mov') || file.name.endsWith('.mkv'))
+        .filter(file => /\.(mp4|mov|mkv|webm)$/.test(file.name))
         .map(async (file) => {
           try {
             const [metadata] = await file.getMetadata();
-            
-            // Generate new presigned URL (48 hours)
-            const [presignedUrl] = await file.getSignedUrl({
-              action: 'read',
-              expires: Date.now() + 48 * 60 * 60 * 1000,
-            });
+            const customMeta = metadata.metadata || {};
 
-            const gcsUri = `gs://${BUCKET_NAME}/${file.name}`;
-            const analysisData = analysisResults.get(gcsUri);
+            // Try deviceId from metadata or extract from GCS path (devices/<deviceId>/...)
+            const pathParts = file.name.split('/');
+            const deviceId = customMeta.deviceId || pathParts[1] || 'unknown';
 
-            return {
-              filename: file.name,
-              gcsUri,
-              presignedUrl,
-              expiresAt: new Date(Date.now() + 48 * 60 * 60 * 1000).toISOString(),
-              size: metadata.size,
-              created: metadata.timeCreated,
-              updated: metadata.updated,
-              analysisStatus: analysisData ? (analysisData.status === 'failed' ? 'failed' : 'completed') : 'pending',
-              analysisCompletedAt: analysisData?.completedAt,
-              deviceId: metadata.metadata?.deviceId || 'unknown',
-              sessionId: file.name.split('/')[2] || 'unknown', // Extract from path
-              chunkIndex: metadata.metadata?.chunkIndex || 'unknown'
+            const videoEntry = {
+              startTime: customMeta.startTime || metadata.timeCreated,
+              endTime: customMeta.endTime || metadata.updated,
+              uri: `gs://${BUCKET_NAME}/${file.name}`,
+              publicUrl: `https://storage.googleapis.com/${BUCKET_NAME}/${file.name}`
             };
-          } catch (error) {
-            console.warn(`⚠️  Could not get metadata for ${file.name}:`, error.message);
-            return {
-              filename: file.name,
-              gcsUri: `gs://${BUCKET_NAME}/${file.name}`,
-              error: 'Metadata unavailable'
-            };
+
+            if (!groupedVideos[deviceId]) {
+              groupedVideos[deviceId] = [];
+            }
+
+            groupedVideos[deviceId].push(videoEntry);
+          } catch (err) {
+            console.warn(`⚠️ Skipping ${file.name}:`, err.message);
           }
         })
     );
 
-    res.json({
-      success: true,
-      videos: videos.filter(v => !v.error), // Only return successful ones
-      total: videos.filter(v => !v.error).length,
-      timestamp: new Date().toISOString()
-    });
+    // Sort each device group by startTime
+    for (const deviceId in groupedVideos) {
+      groupedVideos[deviceId].sort((a, b) => new Date(a.startTime) - new Date(b.startTime));
+    }
+
+    res.json(sortGroupedVideosByTime(groupedVideos));
 
   } catch (error) {
     console.error('❌ Error listing videos:', error.message);
@@ -873,6 +972,8 @@ app.get('/videos', async (req, res) => {
     });
   }
 });
+
+
 
 // Get videos by device ID
 app.get('/videos/device/:deviceId', async (req, res) => {
@@ -1129,7 +1230,7 @@ app.post('/analyze-all-videos', async (req, res) => {
     });
 
     const videoFiles = files.filter(file => 
-      file.name.endsWith('.mp4') || file.name.endsWith('.mov') || file.name.endsWith('.mkv')
+      file.name.endsWith('.mp4') || file.name.endsWith('.mov') || file.name.endsWith('.mkv') || file.name.endsWith('.webm')
     );
 
     let analysisTasks = [];
@@ -1275,54 +1376,7 @@ app.get('/api/upload-status', async (req, res) => {
   }
 });
 
-// Debug endpoint for temp directory and upload status
-app.get('/debug/temp-status', async (req, res) => {
-  try {
-    const tempFiles = await fs.readdir(TEMP_DIR);
-    const videoFiles = tempFiles.filter(file => 
-      (file.endsWith('.mp4') || file.endsWith('.mov') || file.endsWith('.mkv')) &&
-      !file.includes('.metadata.json')
-    );
-    const metadataFiles = tempFiles.filter(file => file.includes('.metadata.json'));
-    
-    // Get pending uploads from all sessions
-    const allSessions = Array.from(activeSessions.values());
-    const pendingUploads = allSessions.reduce((acc, session) => {
-      const pending = (session.uploads || []).filter(u => u.status === 'pending_gcs_upload');
-      return acc.concat(pending.map(u => ({
-        sessionId: session.sessionId,
-        uploadId: u.uploadId,
-        chunkIndex: u.chunkIndex,
-        tempPath: u.tempPath
-      })));
-    }, []);
-    
-    res.json({
-      timestamp: new Date(),
-      tempDirectory: {
-        path: TEMP_DIR,
-        videoFiles: videoFiles.length,
-        metadataFiles: metadataFiles.length,
-        videoFilesList: videoFiles,
-        metadataFilesList: metadataFiles
-      },
-      uploadStatus: {
-        pendingGcsUploads: pendingUploads.length,
-        pendingUploadsList: pendingUploads
-      },
-      services: {
-        gcs: GCS_ENABLED,
-        tempMonitoring: GCS_ENABLED ? 'Active (2s intervals)' : 'Disabled'
-      }
-    });
-  } catch (error) {
-    res.status(500).json({
-      timestamp: new Date(),
-      error: error.message,
-      tempDirectory: TEMP_DIR
-    });
-  }
-});
+
 
 // ==============================================
 // HEIMDALL AI SECURITY SYSTEM API ENDPOINTS
