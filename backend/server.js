@@ -1,614 +1,859 @@
+require('dotenv').config();
 const express = require('express');
 const multer = require('multer');
-const cors = require('cors');
-const fs = require('fs-extra');
 const path = require('path');
-const cron = require('node-cron');
+const fs = require('fs').promises;
 const { Storage } = require('@google-cloud/storage');
+const videoIntelligence = require('@google-cloud/video-intelligence').v1;
+const cors = require('cors');
 const { v4: uuidv4 } = require('uuid');
 
 const app = express();
+
+// Configuration
 const PORT = process.env.PORT || 3001;
-
-// Middleware
-app.use(cors());
-app.use(express.json());
-
-// Create necessary directories
 const TEMP_DIR = path.join(__dirname, 'temp');
 const UPLOADS_DIR = path.join(__dirname, 'uploads');
+const BUCKET_NAME = process.env.GCS_BUCKET_NAME || 'videouploader-heimdall';
+const GCLOUD_KEYFILE = path.join(__dirname, process.env.GCLOUD_KEYFILE || 'heimdall-cam.json');
+const GCLOUD_PROJECT_ID = process.env.GCLOUD_PROJECT_ID;
 
-fs.ensureDirSync(TEMP_DIR);
-fs.ensureDirSync(UPLOADS_DIR);
+// Service status flags
+let GCS_ENABLED = false;
+let VIDEO_AI_ENABLED = false;
 
-// Initialize Google Cloud Storage
-const storage = new Storage({
-  keyFilename: path.join(__dirname, 'heimdall-cam.json'),
-  projectId: 'heimdall-cam'
+console.log('🔧 Heimdall Backend v3.0 Configuration:');
+console.log(`📁 Temp Directory: ${TEMP_DIR}`);
+console.log(`📁 Uploads Directory: ${UPLOADS_DIR}`);
+console.log(`🪣 GCS Bucket: ${BUCKET_NAME}`);
+console.log(`🔑 GCS Key File: ${GCLOUD_KEYFILE}`);
+console.log(`🏢 GCP Project ID: ${GCLOUD_PROJECT_ID}`);
+
+// Ensure directories exist
+Promise.all([
+  fs.mkdir(TEMP_DIR, { recursive: true }),
+  fs.mkdir(UPLOADS_DIR, { recursive: true })
+]).catch(console.error);
+
+// Initialize Google Cloud services
+let storage, videoClient;
+
+async function initializeGoogleCloudServices() {
+  try {
+    // Check if key file exists
+    try {
+      await fs.access(GCLOUD_KEYFILE);
+      console.log('✅ GCS key file found');
+    } catch (error) {
+      console.log('❌ GCS key file not found at:', GCLOUD_KEYFILE);
+      console.log('⚠️  GCS upload will be disabled');
+      return;
+    }
+
+    if (!GCLOUD_PROJECT_ID) {
+      console.log('❌ GCLOUD_PROJECT_ID environment variable not set');
+      console.log('⚠️  GCS upload will be disabled');
+      return;
+    }
+
+    // Initialize Storage
+    storage = new Storage({
+      keyFilename: GCLOUD_KEYFILE,
+      projectId: GCLOUD_PROJECT_ID,
+    });
+
+    // Test bucket access
+    try {
+      const bucket = storage.bucket(BUCKET_NAME);
+      await bucket.getMetadata();
+      console.log('✅ GCS Storage initialized and bucket accessible');
+      GCS_ENABLED = true;
+    } catch (bucketError) {
+      console.log('❌ GCS bucket access failed:', bucketError.message);
+      return;
+    }
+
+    // Initialize Video Intelligence
+    try {
+      videoClient = new videoIntelligence.VideoIntelligenceServiceClient({
+        keyFilename: GCLOUD_KEYFILE,
+      });
+      console.log('✅ Video Intelligence API initialized');
+      VIDEO_AI_ENABLED = true;
+    } catch (videoError) {
+      console.log('❌ Video Intelligence initialization failed:', videoError.message);
+    }
+
+  } catch (error) {
+    console.error('❌ Google Cloud services initialization failed:', error.message);
+  }
+}
+
+// CORS configuration
+app.use(cors({
+  origin: '*',
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'ngrok-skip-browser-warning', 'Origin', 'Accept'],
+  credentials: true,
+  maxAge: 86400
+}));
+
+// Additional middleware for ngrok compatibility
+app.use((req, res, next) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization, ngrok-skip-browser-warning');
+  
+  if (req.method === 'OPTIONS') {
+    return res.status(200).end();
+  }
+  
+  next();
 });
 
-const bucketName = 'videouploader-heimdall';
-const bucket = storage.bucket(bucketName);
+app.use(express.json());
 
-// Configure multer for video uploads
+// Multer configuration for temporary file storage
 const upload = multer({
   dest: TEMP_DIR,
   limits: {
-    fileSize: 100 * 1024 * 1024, // 100MB limit
-    files: 2 // Allow video and metadata files
+    fileSize: 500 * 1024 * 1024, // 500MB limit
+    files: 2 // video + metadata
   },
   fileFilter: (req, file, cb) => {
-    // Accept video files and metadata JSON
-    if (file.mimetype.startsWith('video/') || file.fieldname === 'metadata') {
+    if (file.fieldname === 'video' && file.mimetype.startsWith('video/')) {
+      cb(null, true);
+    } else if (file.fieldname === 'metadata' && file.mimetype === 'application/json') {
       cb(null, true);
     } else {
-      cb(new Error('Only video and metadata files are allowed!'), false);
+      cb(new Error(`Invalid file type for field ${file.fieldname}: ${file.mimetype}`));
     }
-  }
+  },
 });
 
-// Configure multer to handle multiple file uploads
-const uploadMultiple = upload.fields([
-  { name: 'video', maxCount: 1 },
-  { name: 'metadata', maxCount: 1 }
-]);
+// Active recording sessions
+const activeSessions = new Map();
+const uploadQueue = new Map(); // Track upload status
 
-// Store current recording session
-let currentRecording = {
-  isRecording: false,
-  startTime: null,
-  chunks: [],
-  sessionId: null,
-  metadata: null
-};
+// Immediate GCP upload function with presigned URL generation
+async function uploadToGCPImmediately(localFilePath, gcsPath, metadata = {}) {
+  if (!GCS_ENABLED) {
+    console.log('⚠️  GCS disabled, skipping upload for:', gcsPath);
+    return { success: false, reason: 'GCS_DISABLED' };
+  }
+
+  try {
+    console.log(`📤 Starting immediate GCS upload: ${localFilePath} → gs://${BUCKET_NAME}/${gcsPath}`);
+    
+    const startTime = Date.now();
+    const bucket = storage.bucket(BUCKET_NAME);
+    const file = bucket.file(gcsPath);
+
+    // Upload with metadata
+    await bucket.upload(localFilePath, {
+      destination: gcsPath,
+      metadata: {
+        contentType: 'video/mp4',
+        cacheControl: 'public, max-age=31536000',
+        metadata: {
+          ...metadata,
+          uploadTimestamp: new Date().toISOString(),
+          originalPath: localFilePath,
+          analysisStatus: 'pending' // Mark for later analysis
+        }
+      },
+    });
+
+    // Generate presigned URL valid for 48 hours
+    const [presignedUrl] = await file.getSignedUrl({
+      action: 'read',
+      expires: Date.now() + 48 * 60 * 60 * 1000, // 48 hours from now
+    });
+
+    const duration = Date.now() - startTime;
+    console.log(`✅ GCS upload completed in ${duration}ms: gs://${BUCKET_NAME}/${gcsPath}`);
+    console.log(`🔗 Presigned URL generated (48h validity): ${presignedUrl.substring(0, 100)}...`);
+    
+    return { 
+      success: true, 
+      gcsUri: `gs://${BUCKET_NAME}/${gcsPath}`,
+      presignedUrl,
+      expiresAt: new Date(Date.now() + 48 * 60 * 60 * 1000).toISOString(),
+      duration,
+      metadata 
+    };
+
+  } catch (error) {
+    console.error(`❌ GCS upload failed for ${gcsPath}:`, error.message);
+    return { 
+      success: false, 
+      error: error.message,
+      gcsPath 
+    };
+  }
+}
+
+// Process video for AI analysis
+async function processVideoAnalysis(gcsUri, metadata) {
+  if (!VIDEO_AI_ENABLED) {
+    console.log('⚠️  Video AI disabled, skipping analysis for:', gcsUri);
+    return null;
+  }
+
+  try {
+    console.log(`🤖 Starting AI analysis for: ${gcsUri}`);
+    
+    const request = {
+      inputUri: gcsUri,
+      features: [
+        'LABEL_DETECTION',
+        'PERSON_DETECTION',
+        'OBJECT_TRACKING',
+        'TEXT_DETECTION',
+      ],
+      videoContext: {
+        personDetectionConfig: {
+          includeBoundingBoxes: true,
+          includeAttributes: true,
+        },
+        labelDetectionConfig: {
+          model: 'builtin/latest',
+        },
+      },
+    };
+
+    const [operation] = await videoClient.annotateVideo(request);
+    const [result] = await operation.promise();
+    
+    console.log(`✅ AI analysis completed for: ${gcsUri}`);
+    return {
+      ...result.annotationResults[0],
+      processedAt: new Date().toISOString(),
+      metadata
+    };
+
+  } catch (error) {
+    console.error(`❌ AI analysis failed for ${gcsUri}:`, error.message);
+    return {
+      error: error.message,
+      processedAt: new Date().toISOString(),
+      metadata
+    };
+  }
+}
+
+// Clean up local temp file after processing
+async function cleanupTempFile(filePath) {
+  try {
+    await fs.unlink(filePath);
+    console.log(`🗑️  Cleaned up temp file: ${filePath}`);
+  } catch (error) {
+    console.warn(`⚠️  Failed to cleanup temp file: ${filePath}`, error.message);
+  }
+}
+
+// Move file to permanent storage
+async function moveToUploads(tempPath, sessionId, chunkIndex, deviceId = 'unknown') {
+  try {
+    const deviceDir = path.join(UPLOADS_DIR, deviceId);
+    const sessionDir = path.join(deviceDir, sessionId);
+    await fs.mkdir(sessionDir, { recursive: true });
+    
+    const timestamp = new Date().toISOString().replace(/:/g, '-').split('.')[0];
+    const fileName = `chunk_${chunkIndex}_${timestamp}.mp4`;
+    const permanentPath = path.join(sessionDir, fileName);
+    
+    await fs.copyFile(tempPath, permanentPath);
+    console.log(`📁 Moved to permanent storage: ${permanentPath}`);
+    
+    return permanentPath;
+  } catch (error) {
+    console.error('❌ Failed to move file to permanent storage:', error);
+    throw error;
+  }
+}
+
+// Monitor and upload temp files to GCP in parallel
+async function uploadTempFilesToGCP() {
+  if (!GCS_ENABLED) {
+    console.log('⚠️  GCS disabled, skipping temp file uploads');
+    return;
+  }
+
+  try {
+    const tempFiles = await fs.readdir(TEMP_DIR);
+    const videoFiles = tempFiles.filter(file => 
+      file.endsWith('.mp4') || file.endsWith('.mov') || file.endsWith('.mkv')
+    );
+
+    if (videoFiles.length === 0) {
+      return;
+    }
+
+    console.log(`📁 Found ${videoFiles.length} video files in temp directory, uploading to GCP...`);
+
+    // Upload files in parallel
+    const uploadPromises = videoFiles.map(async (filename) => {
+      const localPath = path.join(TEMP_DIR, filename);
+      const gcsPath = `temp-uploads/${Date.now()}-${filename}`;
+      
+      try {
+        const result = await uploadToGCPImmediately(localPath, gcsPath, {
+          source: 'temp-directory',
+          originalFilename: filename,
+          foundAt: new Date().toISOString()
+        });
+
+        if (result.success) {
+          // Clean up local temp file after successful upload
+          await cleanupTempFile(localPath);
+          console.log(`✅ Temp file uploaded and cleaned: ${filename}`);
+          return { filename, success: true, gcsUri: result.gcsUri };
+        } else {
+          console.log(`❌ Failed to upload temp file: ${filename}`, result.error);
+          return { filename, success: false, error: result.error };
+        }
+      } catch (error) {
+        console.error(`❌ Error uploading temp file ${filename}:`, error.message);
+        return { filename, success: false, error: error.message };
+      }
+    });
+
+    const results = await Promise.all(uploadPromises);
+    const successful = results.filter(r => r.success).length;
+    const failed = results.filter(r => !r.success).length;
+
+    console.log(`📊 Temp upload results: ${successful} successful, ${failed} failed`);
+    return results;
+
+  } catch (error) {
+    console.error('❌ Error scanning temp directory:', error.message);
+  }
+}
+
+// Start periodic temp file monitoring
+function startTempFileMonitoring() {
+  if (GCS_ENABLED) {
+    console.log('🔄 Starting temp file monitoring (every 30 seconds)');
+    
+    // Initial upload
+    uploadTempFilesToGCP();
+    
+    // Set up periodic monitoring
+    setInterval(() => {
+      uploadTempFilesToGCP();
+    }, 30000); // Check every 30 seconds
+  }
+}
 
 // API Routes
 
 // Health check
 app.get('/health', (req, res) => {
-  res.json({ 
-    status: 'OK', 
-    timestamp: new Date().toISOString(),
-    recording: currentRecording.isRecording 
+  res.json({
+    status: 'healthy',
+    timestamp: new Date(),
+    server: 'Heimdall Backend v3.0',
+    activeSessions: activeSessions.size,
+    services: {
+      gcs: {
+        enabled: GCS_ENABLED,
+        bucket: BUCKET_NAME,
+      },
+      videoAI: {
+        enabled: VIDEO_AI_ENABLED,
+      },
+    },
+    configuration: {
+      tempDir: TEMP_DIR,
+      uploadsDir: UPLOADS_DIR,
+      port: PORT,
+    }
   });
 });
 
 // Start recording session
 app.post('/start-recording', (req, res) => {
   try {
-    if (currentRecording.isRecording) {
-      console.warn('Warning: A recording was already in progress. Force-stopping to start a new one.');
-      // Immediately reset the state before proceeding
-      currentRecording = {
-        isRecording: false,
-        startTime: null,
-        chunks: [],
-        sessionId: null,
-        metadata: null
-      };
-    }
-
-    // Extract metadata from request body
-    const { metadata } = req.body;
-    
-    currentRecording = {
-      isRecording: true,
+    const sessionId = uuidv4();
+    const session = {
+      sessionId,
       startTime: new Date(),
-      chunks: [],
-      sessionId: uuidv4(),
-      metadata: metadata || null
+      chunkCount: 0,
+      status: 'active',
+      uploads: []
     };
-
-    console.log(`Recording started - Session ID: ${currentRecording.sessionId}`);
-    if (currentRecording.metadata) {
-      console.log('Recording metadata:', JSON.stringify(currentRecording.metadata, null, 2));
-    }
     
-    res.json({ 
-      message: 'Recording started successfully',
-      sessionId: currentRecording.sessionId,
-      startTime: currentRecording.startTime,
-      metadata: currentRecording.metadata
+    activeSessions.set(sessionId, session);
+    console.log(`🎬 Recording session started: ${sessionId}`);
+    
+    res.json({
+      success: true,
+      sessionId,
+      startTime: session.startTime,
+      message: 'Recording session started successfully'
     });
+    
   } catch (error) {
-    console.error('Error starting recording:', error);
-    res.status(500).json({ error: 'Failed to start recording' });
+    console.error('❌ Failed to start recording session:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
   }
 });
 
 // Stop recording session
-app.post('/stop-recording', async (req, res) => {
+app.post('/stop-recording', (req, res) => {
   try {
-    if (!currentRecording.isRecording) {
-      return res.status(400).json({ error: 'No active recording session' });
+    const { sessionId } = req.body;
+    
+    if (sessionId && activeSessions.has(sessionId)) {
+      const session = activeSessions.get(sessionId);
+      session.status = 'stopped';
+      session.endTime = new Date();
+      
+      console.log(`🛑 Recording session stopped: ${sessionId}`);
+      
+      res.json({
+        success: true,
+        sessionId,
+        summary: {
+          duration: session.endTime - session.startTime,
+          chunksProcessed: session.chunkCount,
+          uploads: session.uploads.length
+        }
+      });
+    } else {
+      res.json({
+        success: true,
+        message: 'No active session to stop'
+      });
     }
-
-    const endTime = new Date();
-    const duration = endTime - currentRecording.startTime;
-    const stoppedSessionId = currentRecording.sessionId;
-
-    console.log(`Recording stopped - Session ID: ${stoppedSessionId}, Duration: ${duration}ms`);
-
-    // Mark as not recording and process any remaining chunks
-    currentRecording.isRecording = false;
-    await processVideoChunks();
-
-    // Reset recording state completely
-    currentRecording = {
-      isRecording: false,
-      startTime: null,
-      chunks: [],
-      sessionId: null
-    };
-
-    res.json({ 
-      message: 'Recording stopped successfully',
-      sessionId: stoppedSessionId,
-      duration: duration,
-    });
-
+    
   } catch (error) {
-    console.error('Error stopping recording:', error);
-    res.status(500).json({ error: 'Failed to stop recording' });
+    console.error('❌ Failed to stop recording session:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
   }
 });
 
-// Upload video chunk with metadata
-app.post('/upload-chunk', uploadMultiple, async (req, res) => {
-  let videoFile = null;
-  let metadata = null;
-
+// Upload video chunk - main endpoint
+app.post('/upload-chunk', upload.fields([
+  { name: 'video', maxCount: 1 },
+  { name: 'metadata', maxCount: 1 }
+]), async (req, res) => {
+  const startTime = Date.now();
+  const uploadId = uuidv4();
+  
+  console.log(`📥 Upload request received [${uploadId}] at ${new Date().toISOString()}`);
+  
   try {
-    // Check if we have a video file
-    if (!req.files || !req.files.video || req.files.video.length === 0) {
-      return res.status(400).json({ error: 'No video file provided' });
+    const files = req.files;
+    const videoFile = files?.video?.[0];
+    const metadataFile = files?.metadata?.[0];
+    
+    if (!videoFile) {
+      return res.status(400).json({
+        success: false,
+        error: 'No video file provided',
+        uploadId
+      });
     }
-    videoFile = req.files.video[0];
 
-    // Check for metadata file
-    if (req.files.metadata && req.files.metadata.length > 0) {
+    // Parse metadata if provided
+    let metadata = {};
+    if (metadataFile) {
       try {
-        const metadataPath = req.files.metadata[0].path;
-        const metadataContent = await fs.readFile(metadataPath, 'utf-8');
+        const metadataContent = await fs.readFile(metadataFile.path, 'utf8');
         metadata = JSON.parse(metadataContent);
+        console.log(`📋 Metadata parsed for upload [${uploadId}]`);
         
-        // Clean up the temporary metadata file
-        await fs.remove(metadataPath);
-        
-        // Update the current recording metadata if this is the first chunk
-        if (currentRecording.chunks.length === 0 && !currentRecording.metadata) {
-          currentRecording.metadata = metadata;
-          console.log('Updated recording metadata from first chunk:', 
-            JSON.stringify(metadata, null, 2));
-        }
-      } catch (error) {
-        console.error('Error processing metadata:', error);
-        // Don't fail the upload if metadata processing fails
+        // Clean up metadata temp file immediately
+        await cleanupTempFile(metadataFile.path);
+      } catch (metadataError) {
+        console.warn(`⚠️  Failed to parse metadata for upload [${uploadId}]:`, metadataError.message);
       }
     }
 
-    if (!currentRecording.isRecording) {
-      // Clean up uploaded files if no active recording
-      await Promise.all([
-        videoFile && fs.remove(videoFile.path).catch(console.error),
-        req.files.metadata && req.files.metadata[0] && 
-          fs.remove(req.files.metadata[0].path).catch(console.error)
-      ]);
-      return res.status(400).json({ error: 'No active recording session' });
+    const chunkIndex = metadata.chunkIndex || Date.now();
+    const sessionId = metadata.sessionId || 'unknown';
+    
+    console.log(`📹 Processing video chunk [${uploadId}] - Session: ${sessionId}, Chunk: ${chunkIndex}`);
+    
+    // Update session info
+    if (activeSessions.has(sessionId)) {
+      const session = activeSessions.get(sessionId);
+      session.chunkCount++;
+      session.lastChunkTime = new Date();
     }
 
-    // Move the uploaded chunk from TEMP_DIR to UPLOADS_DIR for persistence
-    const uniqueName = `${currentRecording.sessionId || 'unknown'}_${Date.now()}_${videoFile.originalname}`;
-    const destPath = path.join(UPLOADS_DIR, uniqueName);
-    await fs.move(videoFile.path, destPath, { overwrite: true });
-
-    const chunkInfo = {
-      filename: uniqueName,
-      originalName: videoFile.originalname,
-      path: destPath,
-      size: videoFile.size,
-      timestamp: new Date(),
-      chunkIndex: currentRecording.chunks.length,
-      metadata: metadata || undefined
-    };
-
-    currentRecording.chunks.push(chunkInfo);
-
-    console.log(`Chunk uploaded - Session: ${currentRecording.sessionId}, ` +
-      `Chunk: ${chunkInfo.chunkIndex}, Size: ${(videoFile.size / (1024 * 1024)).toFixed(2)}MB`);
-    if (metadata) {
-      console.log(`Chunk ${chunkInfo.chunkIndex} metadata:`, 
-        JSON.stringify(metadata, null, 2));
+    // 1. IMMEDIATE GCP UPLOAD (simultaneous with other operations)
+    const deviceId = metadata.deviceId || 'unknown';
+    const timestamp = new Date().toISOString().replace(/:/g, '-').split('.')[0]; // Clean timestamp
+    const gcsPath = `devices/${deviceId}/sessions/${sessionId}/chunks/chunk_${chunkIndex}_${timestamp}.mp4`;
+    
+    // Start GCP upload immediately (don't await yet)
+    const gcsUploadPromise = uploadToGCPImmediately(videoFile.path, gcsPath, metadata);
+    
+    // 2. SIMULTANEOUSLY move to permanent storage
+    const permanentStoragePromise = moveToUploads(videoFile.path, sessionId, chunkIndex, deviceId);
+    
+    // 3. Wait for both operations to complete
+    const [gcsResult, permanentPath] = await Promise.all([
+      gcsUploadPromise,
+      permanentStoragePromise
+    ]);
+    
+    // 4. Clean up temp file after successful operations
+    await cleanupTempFile(videoFile.path);
+    
+    // 5. Store upload info with presigned URL (no immediate AI analysis)
+    if (gcsResult.success && activeSessions.has(sessionId)) {
+      const session = activeSessions.get(sessionId);
+      session.uploads.push({
+        uploadId,
+        chunkIndex,
+        gcsUri: gcsResult.gcsUri,
+        presignedUrl: gcsResult.presignedUrl,
+        expiresAt: gcsResult.expiresAt,
+        localPath: permanentPath,
+        analysisStatus: 'pending', // Ready for later analysis
+        timestamp: new Date()
+      });
     }
+    
+    const totalDuration = Date.now() - startTime;
+    
+    console.log(`✅ Upload [${uploadId}] completed in ${totalDuration}ms`);
+    console.log(`   📤 GCS Upload: ${gcsResult.success ? '✅' : '❌'} (${gcsResult.duration || 0}ms)`);
+    console.log(`   📁 Local Storage: ✅`);
+    console.log(`   🔗 Presigned URL: ${gcsResult.success ? '✅ 48h validity' : '❌'}`);
 
+    // Send response with presigned URL for immediate access
     res.json({
-      message: 'Video chunk uploaded successfully',
-      chunkIndex: chunkInfo.chunkIndex,
-      sessionId: currentRecording.sessionId,
-      metadataReceived: !!metadata
+      success: true,
+      uploadId,
+      sessionId,
+      chunkIndex,
+      gcsUpload: {
+        success: gcsResult.success,
+        gcsUri: gcsResult.gcsUri,
+        presignedUrl: gcsResult.presignedUrl,
+        expiresAt: gcsResult.expiresAt
+      },
+      localPath: permanentPath,
+      processingTime: totalDuration,
+      timestamp: new Date().toISOString(),
+      message: 'Video chunk uploaded successfully with 48h access URL'
     });
+
   } catch (error) {
-    console.error('Error uploading chunk:', error);
+    const duration = Date.now() - startTime;
+    console.error(`❌ Upload [${uploadId}] failed after ${duration}ms:`, error.message);
     
-    // Clean up any uploaded files in case of error
-    try {
-      await Promise.all([
-        videoFile && fs.remove(videoFile.path).catch(console.error),
-        req.files?.metadata?.[0]?.path && 
-          fs.remove(req.files.metadata[0].path).catch(console.error)
-      ]);
-    } catch (cleanupError) {
-      console.error('Error during cleanup:', cleanupError);
-    }
-    
-    res.status(500).json({ 
-      error: 'Failed to upload video chunk',
-      details: error.message 
+    res.status(500).json({
+      success: false,
+      uploadId,
+      error: error.message,
+      processingTime: duration,
+      timestamp: new Date().toISOString()
     });
   }
 });
 
-// Get recording status
-app.get('/recording-status', (req, res) => {
+// Get session status
+app.get('/session/:sessionId', (req, res) => {
+  const { sessionId } = req.params;
+  
+  if (activeSessions.has(sessionId)) {
+    const session = activeSessions.get(sessionId);
+    res.json({
+      success: true,
+      session: {
+        ...session,
+        uploads: session.uploads || []
+      }
+    });
+  } else {
+    res.status(404).json({
+      success: false,
+      error: 'Session not found'
+    });
+  }
+});
+
+// List all sessions
+app.get('/sessions', (req, res) => {
+  const sessions = Array.from(activeSessions.entries()).map(([id, session]) => ({
+    sessionId: id,
+    ...session
+  }));
+  
   res.json({
-    isRecording: currentRecording.isRecording,
-    sessionId: currentRecording.sessionId,
-    startTime: currentRecording.startTime,
-    chunksCount: currentRecording.chunks.length,
-    duration: currentRecording.startTime ? new Date() - currentRecording.startTime : 0
+    success: true,
+    sessions,
+    total: sessions.length
   });
 });
 
-/**
- * Uploads a file to Google Cloud Storage with optional metadata
- * @param {string} filePath - Path to the local file to upload
- * @param {string} fileName - Destination filename in the bucket
- * @param {Object} [metadata={}] - Additional metadata to include with the file
- * @returns {Promise<string>} The destination path in the bucket
- */
-async function uploadToGCP(filePath, fileName, metadata = {}) {
+// List all uploaded videos
+app.get('/videos', async (req, res) => {
   try {
-    // Ensure the filename is URL-safe
-    const safeFileName = fileName.replace(/[^a-zA-Z0-9-_.]/g, '_');
-    const destination = `videos/${new Date().toISOString().split('T')[0]}/${safeFileName}`;
-    
-    // Prepare metadata with defaults
-    const fileMetadata = {
-      metadata: {
-        uploadedAt: new Date().toISOString(),
-        source: 'heimdall-cam',
-        ...metadata // Spread the provided metadata
-      }
-    };
+    if (!GCS_ENABLED) {
+      return res.status(503).json({
+        success: false,
+        error: 'GCS not enabled'
+      });
+    }
 
-    console.log(`Uploading ${filePath} to GCP bucket ${bucketName}/${destination}`);
-    console.log('With metadata:', JSON.stringify(fileMetadata, null, 2));
-    
-    // Upload the file
-    await bucket.upload(filePath, {
-      destination: destination,
-      metadata: fileMetadata,
-      // Enable resumable uploads for large files
-      resumable: true,
-      // Set content type based on file extension
-      contentType: filePath.endsWith('.mp4') ? 'video/mp4' : 
-                  filePath.endsWith('.mov') ? 'video/quicktime' :
-                  'application/octet-stream'
+    const bucket = storage.bucket(BUCKET_NAME);
+    const [files] = await bucket.getFiles({
+      prefix: 'devices/', // Get all video files under devices/
     });
 
-    console.log(`Successfully uploaded ${fileName} to GCP bucket: ${bucketName}/${destination}`);
-    return destination;
-  } catch (error) {
-    console.error('Error uploading to GCP:', error);
-    // Enhance error with more context
-    const enhancedError = new Error(`Failed to upload ${fileName} to GCP: ${error.message}`);
-    enhancedError.originalError = error;
-    enhancedError.filePath = filePath;
-    enhancedError.fileName = fileName;
-    enhancedError.metadata = metadata;
-    throw enhancedError;
-  }
-}
-
-// Function to process and upload video chunks
-// async function processVideoChunks() {
-//   try {
-//     // if (!currentRecording.isRecording || currentRecording.chunks.length === 0) {
-//     //   return;
-//     // }
-
-//     if (currentRecording.chunks.length === 0) {
-//         return;
-//     }
-  
-//     console.log(`Processing ${currentRecording.chunks.length} video chunks...`);
-
-//     // Process each chunk
-//     for (const chunk of currentRecording.chunks) {
-//       try {
-//         const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-//         const fileName = `heimdall-cam-${currentRecording.sessionId}-chunk-${chunk.chunkIndex}-${timestamp}.${chunk.originalName.split('.').pop()}`;
-        
-//         // Upload to GCP
-//         await uploadToGCP(chunk.path, fileName);
-        
-//         // Clean up local file after successful upload
-//         await fs.remove(chunk.path);
-        
-//         console.log(`Chunk ${chunk.chunkIndex} processed and uploaded successfully`);
-//       } catch (error) {
-//         console.error(`Error processing chunk ${chunk.chunkIndex}:`, error);
-//       }
-//     }
-
-//     // Clear processed chunks
-//     currentRecording.chunks = [];
-    
-//   } catch (error) {
-//     console.error('Error in processVideoChunks:', error);
-//   }
-// }
-
-
-/**
- * Processes video chunks from the uploads directory and uploads them to GCP
- * Also processes any pending chunks in memory
- */
-async function processVideoChunks() {
-  try {
-    // Process in-memory chunks first
-    if (currentRecording.chunks && currentRecording.chunks.length > 0) {
-      console.log(`[${new Date().toISOString()}] Processing ${currentRecording.chunks.length} in-memory video chunks...`);
-      
-      // Create a copy of the chunks array to avoid modification during iteration
-      const chunksToProcess = [...currentRecording.chunks];
-      let processedCount = 0;
-      let errorCount = 0;
-      
-      for (const chunk of chunksToProcess) {
-        try {
-          if (!chunk.processed && chunk.path) {
-            const fileExists = await fs.pathExists(chunk.path);
-            if (!fileExists) {
-              console.warn(`[${new Date().toISOString()}] Chunk file not found: ${chunk.path}`);
-              chunk.processed = true; // Mark as processed to avoid retrying
-              errorCount++;
-              continue;
-            }
-            
-            const fileStats = await fs.stat(chunk.path);
-            if (fileStats.size === 0) {
-              console.warn(`[${new Date().toISOString()}] Chunk file is empty: ${chunk.path}`);
-              chunk.processed = true; // Mark as processed to avoid retrying
-              errorCount++;
-              await fs.remove(chunk.path); // Clean up empty file
-              continue;
-            }
-            
-            const timestamp = chunk.timestamp || new Date();
-            const chunkIndex = chunk.chunkIndex || 'unknown';
-            const sessionId = currentRecording.sessionId || 'unknown';
-            
-            const fileName = `sessions/${sessionId}/` +
-              `${new Date(timestamp).toISOString().replace(/[:.]/g, '-')}_` +
-              `${chunkIndex}${chunk.filename ? path.extname(chunk.filename) : '.mp4'}`;
-            
-            // Add metadata to GCP metadata
-            const metadata = {
-              uploadedAt: new Date().toISOString(),
-              source: 'heimdall-cam',
-              sessionId: sessionId,
-              chunkIndex: chunkIndex,
-              timestamp: timestamp.toISOString(),
-              ...(chunk.metadata ? { 
-                deviceInfo: chunk.metadata.deviceInfo,
-                cameraInfo: chunk.metadata.cameraInfo,
-                viewport: chunk.metadata.viewport,
-                orientation: chunk.metadata.orientation,
-                recordingSettings: chunk.metadata.recordingSettings,
-                location: chunk.metadata.location,
-                gyro: chunk.metadata.gyro
-              } : {})
-            };
-            
-            console.log(`[${new Date().toISOString()}] Uploading chunk ${chunkIndex} (${(fileStats.size / (1024 * 1024)).toFixed(2)} MB) to GCP`);
-            
-            await uploadToGCP(chunk.path, fileName, metadata);
-            
-            // Mark as processed and clean up
-            chunk.processed = true;
-            await fs.remove(chunk.path);
-            console.log(`[${new Date().toISOString()}] Successfully processed and uploaded chunk ${chunkIndex}`);
-            processedCount++;
-          }
-        } catch (error) {
-          errorCount++;
-          console.error(`[${new Date().toISOString()}] Error processing in-memory chunk ${chunk.chunkIndex || 'unknown'}:`, error);
-          
-          // If we've failed multiple times, move to error directory
-          chunk.retryCount = (chunk.retryCount || 0) + 1;
-          if (chunk.retryCount > 3) {
-            console.error(`[${new Date().toISOString()}] Max retries exceeded for chunk ${chunk.chunkIndex || 'unknown'}, moving to error directory`);
-            chunk.processed = true; // Don't retry again
-            
-            try {
-              const errorDir = path.join(UPLOADS_DIR, 'error');
-              await fs.ensureDir(errorDir);
-              const errorPath = path.join(errorDir, path.basename(chunk.path));
-              await fs.move(chunk.path, errorPath, { overwrite: true });
-              console.error(`[${new Date().toISOString()}] Moved failed chunk to: ${errorPath}`);
-            } catch (moveError) {
-              console.error(`[${new Date().toISOString()}] Failed to move failed chunk:`, moveError);
-            }
-          }
-        }
-      }
-      
-      // Log processing summary
-      console.log(`[${new Date().toISOString()}] Processed ${processedCount} chunks with ${errorCount} errors`);
-      
-      // Remove processed chunks from memory
-      const beforeCount = currentRecording.chunks.length;
-      currentRecording.chunks = currentRecording.chunks.filter(chunk => !chunk.processed);
-      const removedCount = beforeCount - currentRecording.chunks.length;
-      
-      if (removedCount > 0) {
-        console.log(`[${new Date().toISOString()}] Removed ${removedCount} processed chunks from memory`);
-      }
-    }
-
-    // Process any remaining files in the uploads directory
-    let uploadProcessed = 0;
-    let uploadErrors = 0;
-    
-    try {
-      const uploadFiles = (await fs.readdir(UPLOADS_DIR))
-        .filter(file => {
-          const ext = path.extname(file).toLowerCase();
-          return ['.mp4', '.mov', '.mkv', '.webm'].includes(ext);
-        });
-        
-      if (uploadFiles.length === 0) {
-        console.log(`[${new Date().toISOString()}] No pending video chunks to process in uploads directory.`);
-        return;
-      }
-      
-      console.log(`[${new Date().toISOString()}] Found ${uploadFiles.length} video chunks in uploads/ directory`);
-      
-      for (const file of uploadFiles) {
-        const filePath = path.join(UPLOADS_DIR, file);
-        
-        try {
-          // Check file exists and has content
-          const fileStats = await fs.stat(filePath);
-          if (fileStats.size === 0) {
-            console.warn(`[${new Date().toISOString()}] Skipping empty file: ${file}`);
-            await fs.remove(filePath);
-            continue;
-          }
-          
-          const fileExt = path.extname(file).toLowerCase();
-          const baseName = path.basename(file, fileExt);
-          const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-          const fileName = `sessions/unknown/${timestamp}_${baseName}${fileExt}`;
-          
-          console.log(`[${new Date().toISOString()}] Processing orphaned file: ${file} (${(fileStats.size / (1024 * 1024)).toFixed(2)} MB)`);
-          
-          const metadata = {
-            uploadedAt: new Date().toISOString(),
-            source: 'heimdall-cam',
-            sessionId: 'unknown',
-            originalFilename: file,
-            fileSize: fileStats.size,
-            detectedType: fileExt.replace('.', '')
-          };
-          
-          await uploadToGCP(filePath, fileName, metadata);
-          await fs.remove(filePath);
-          console.log(`[${new Date().toISOString()}] Successfully processed and uploaded ${file}`);
-          uploadProcessed++;
-          
-        } catch (error) {
-          uploadErrors++;
-          console.error(`[${new Date().toISOString()}] Error processing ${file}:`, error);
-          
-          // Move to error directory for manual inspection
+    const videos = await Promise.all(
+      files
+        .filter(file => file.name.endsWith('.mp4') || file.name.endsWith('.mov') || file.name.endsWith('.mkv'))
+        .map(async (file) => {
           try {
-            const errorDir = path.join(UPLOADS_DIR, 'error');
-            await fs.ensureDir(errorDir);
-            const errorPath = path.join(errorDir, `${Date.now()}_${path.basename(file)}`);
-            await fs.move(filePath, errorPath, { overwrite: true });
-            console.error(`[${new Date().toISOString()}] Moved failed file to error directory: ${errorPath}`);
+            const [metadata] = await file.getMetadata();
             
-            // Write error log
-            const errorLogPath = `${errorPath}.error.log`;
-            await fs.writeFile(errorLogPath, JSON.stringify({
-              timestamp: new Date().toISOString(),
-              error: error.toString(),
-              stack: error.stack,
-              metadata: {
-                originalPath: filePath,
-                size: fileStats?.size,
-                mtime: fileStats?.mtime
-              }
-            }, null, 2));
-            
-          } catch (moveError) {
-            console.error(`[${new Date().toISOString()}] Failed to move error file ${file}:`, moveError);
+            // Generate new presigned URL (48 hours)
+            const [presignedUrl] = await file.getSignedUrl({
+              action: 'read',
+              expires: Date.now() + 48 * 60 * 60 * 1000,
+            });
+
+            return {
+              filename: file.name,
+              gcsUri: `gs://${BUCKET_NAME}/${file.name}`,
+              presignedUrl,
+              expiresAt: new Date(Date.now() + 48 * 60 * 60 * 1000).toISOString(),
+              size: metadata.size,
+              created: metadata.timeCreated,
+              updated: metadata.updated,
+              analysisStatus: metadata.metadata?.analysisStatus || 'pending',
+              deviceId: metadata.metadata?.deviceId || 'unknown',
+              sessionId: file.name.split('/')[2] || 'unknown', // Extract from path
+              chunkIndex: metadata.metadata?.chunkIndex || 'unknown'
+            };
+          } catch (error) {
+            console.warn(`⚠️  Could not get metadata for ${file.name}:`, error.message);
+            return {
+              filename: file.name,
+              gcsUri: `gs://${BUCKET_NAME}/${file.name}`,
+              error: 'Metadata unavailable'
+            };
           }
-        }
-      }
-      
-      // Log summary of uploads processing
-      if (uploadProcessed > 0 || uploadErrors > 0) {
-        console.log(`[${new Date().toISOString()}] Processed ${uploadProcessed} upload files with ${uploadErrors} errors`);
-      }
-      
-    } catch (error) {
-      console.error(`[${new Date().toISOString()}] Error processing uploads directory:`, error);
-    }
+        })
+    );
+
+    res.json({
+      success: true,
+      videos: videos.filter(v => !v.error), // Only return successful ones
+      total: videos.filter(v => !v.error).length,
+      timestamp: new Date().toISOString()
+    });
+
   } catch (error) {
-    console.error('Error in processVideoChunks:', error);
-    // Don't rethrow to allow the server to continue running
+    console.error('❌ Error listing videos:', error.message);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
   }
-}
-
-
-cron.schedule('*/10 * * * * *', async () => {
-  console.log('Running scheduled video processing...');
-  await processVideoChunks();
 });
 
-// Cleanup function for graceful shutdown
-async function cleanup() {
+// Trigger video analysis for specific video
+app.post('/analyze-video', async (req, res) => {
   try {
-    console.log('Cleaning up temporary files...');
-    
-    // Process any remaining chunks before shutdown
-    await processVideoChunks();
-    
-    // Clean up temp directory
-    const tempFiles = await fs.readdir(TEMP_DIR);
-    for (const file of tempFiles) {
-      await fs.remove(path.join(TEMP_DIR, file));
+    const { gcsUri, videoId } = req.body;
+
+    if (!gcsUri) {
+      return res.status(400).json({
+        success: false,
+        error: 'gcsUri is required'
+      });
     }
-    
-    console.log('Cleanup completed');
+
+    if (!VIDEO_AI_ENABLED) {
+      return res.status(503).json({
+        success: false,
+        error: 'Video AI not enabled'
+      });
+    }
+
+    const analysisId = uuidv4();
+    console.log(`🤖 Starting manual analysis [${analysisId}] for: ${gcsUri}`);
+
+    // Start analysis (fire and forget)
+    processVideoAnalysis(gcsUri, { 
+      analysisId,
+      videoId: videoId || gcsUri,
+      triggeredAt: new Date().toISOString(),
+      type: 'manual'
+    })
+      .then(result => {
+        console.log(`✅ Manual analysis completed [${analysisId}]`);
+        // Could store results in database here
+      })
+      .catch(error => {
+        console.error(`❌ Manual analysis failed [${analysisId}]:`, error.message);
+      });
+
+    res.json({
+      success: true,
+      analysisId,
+      message: 'Video analysis started',
+      gcsUri,
+      estimatedCompletion: new Date(Date.now() + 5 * 60 * 1000).toISOString() // ~5 minutes
+    });
+
   } catch (error) {
-    console.error('Error during cleanup:', error);
+    console.error('❌ Error starting video analysis:', error.message);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
   }
+});
+
+// Trigger bulk analysis for all pending videos
+app.post('/analyze-all-videos', async (req, res) => {
+  try {
+    if (!VIDEO_AI_ENABLED) {
+      return res.status(503).json({
+        success: false,
+        error: 'Video AI not enabled'
+      });
+    }
+
+    if (!GCS_ENABLED) {
+      return res.status(503).json({
+        success: false,
+        error: 'GCS not enabled'
+      });
+    }
+
+    const bucket = storage.bucket(BUCKET_NAME);
+    const [files] = await bucket.getFiles({
+      prefix: 'devices/',
+    });
+
+    const videoFiles = files.filter(file => 
+      file.name.endsWith('.mp4') || file.name.endsWith('.mov') || file.name.endsWith('.mkv')
+    );
+
+    let analysisTasks = [];
+    let pendingCount = 0;
+
+    for (const file of videoFiles) {
+      try {
+        const [metadata] = await file.getMetadata();
+        const analysisStatus = metadata.metadata?.analysisStatus;
+        
+        if (analysisStatus === 'pending' || !analysisStatus) {
+          const gcsUri = `gs://${BUCKET_NAME}/${file.name}`;
+          const analysisId = uuidv4();
+          
+          analysisTasks.push({
+            analysisId,
+            gcsUri,
+            filename: file.name
+          });
+
+          // Start analysis (fire and forget)
+          processVideoAnalysis(gcsUri, {
+            analysisId,
+            filename: file.name,
+            triggeredAt: new Date().toISOString(),
+            type: 'bulk'
+          })
+            .then(result => {
+              console.log(`✅ Bulk analysis completed [${analysisId}] for: ${file.name}`);
+            })
+            .catch(error => {
+              console.error(`❌ Bulk analysis failed [${analysisId}] for ${file.name}:`, error.message);
+            });
+
+          pendingCount++;
+        }
+      } catch (error) {
+        console.warn(`⚠️  Could not check analysis status for ${file.name}:`, error.message);
+      }
+    }
+
+    res.json({
+      success: true,
+      message: `Started analysis for ${pendingCount} pending videos`,
+      totalVideos: videoFiles.length,
+      pendingAnalysis: pendingCount,
+      alreadyAnalyzed: videoFiles.length - pendingCount,
+      analysisTasks,
+      estimatedCompletion: new Date(Date.now() + pendingCount * 2 * 60 * 1000).toISOString() // ~2 min per video
+    });
+
+  } catch (error) {
+    console.error('❌ Error starting bulk analysis:', error.message);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+// Debug endpoint
+app.get('/debug/status', (req, res) => {
+  res.json({
+    timestamp: new Date(),
+    activeSessions: activeSessions.size,
+    services: {
+      gcs: GCS_ENABLED,
+      videoAI: VIDEO_AI_ENABLED
+    },
+    directories: {
+      temp: TEMP_DIR,
+      uploads: UPLOADS_DIR
+    },
+    server: 'Heimdall Backend v3.0'
+  });
+});
+
+// Initialize and start server
+async function startServer() {
+  console.log('🚀 Starting Heimdall Backend v3.0...');
+  
+  // Initialize Google Cloud services
+  await initializeGoogleCloudServices();
+  
+  // Start temp file monitoring
+  startTempFileMonitoring();
+  
+  // Start the server
+  app.listen(PORT, () => {
+    console.log(`✅ Heimdall Backend v3.0 running on port ${PORT}`);
+    console.log(`🌐 Ready to process video uploads`);
+    console.log(`🔧 Services Status:`);
+    console.log(`   🪣 GCS Upload: ${GCS_ENABLED ? '✅ Enabled' : '❌ Disabled'}`);
+    console.log(`   🤖 Video AI: ${VIDEO_AI_ENABLED ? '✅ Enabled (Separate Analysis)' : '❌ Disabled'}`);
+    console.log(`   📁 Temp Directory: ${TEMP_DIR}`);
+    console.log(`   📁 Uploads Directory: ${UPLOADS_DIR}`);
+    console.log(`   🔗 Presigned URLs: 48-hour validity`);
+    console.log(`   🔄 Temp Monitoring: ${GCS_ENABLED ? '✅ Active (30s intervals)' : '❌ Disabled'}`);
+  });
 }
 
-// Handle graceful shutdown
-process.on('SIGINT', async () => {
-  console.log('Received SIGINT, shutting down gracefully...');
-  await cleanup();
+// Graceful shutdown
+process.on('SIGTERM', () => {
+  console.log('🛑 Shutting down gracefully...');
   process.exit(0);
 });
 
-process.on('SIGTERM', async () => {
-  console.log('Received SIGTERM, shutting down gracefully...');
-  await cleanup();
-  process.exit(0);
+// Start the server
+startServer().catch(error => {
+  console.error('❌ Failed to start server:', error);
+  process.exit(1);
 });
-
-// Error handling middleware
-app.use((error, req, res, next) => {
-  if (error instanceof multer.MulterError) {
-    if (error.code === 'LIMIT_FILE_SIZE') {
-      return res.status(400).json({ error: 'File too large' });
-    }
-  }
-  
-  console.error('Unhandled error:', error);
-  res.status(500).json({ error: 'Internal server error' });
-});
-
-// Start server
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`Heimdall Cam Backend running on port ${PORT}`);
-  console.log(`GCP Bucket: ${bucketName}`);
-  console.log('Video processing scheduled every 10 sec');
-});
-
-module.exports = app;

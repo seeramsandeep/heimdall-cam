@@ -30,7 +30,7 @@ import uuid from 'react-native-uuid';
 // const BACKEND_URL = 'http://10.0.2.2:3001'; // Change this to your backend URL
 
 // Ngrok URL
-const BACKEND_URL = 'https://aaa69efce64b.ngrok-free.app'; // Change this to your backend URL
+const BACKEND_URL = 'https://310783c896b8.ngrok-free.app'; // Change this to your backend URL
 
 // API functions
 const apiCall = async (endpoint: string, method: string = 'GET', body?: any) => {
@@ -133,6 +133,18 @@ const currentChunkIndex = useRef(0);
   const [location, setLocation] = useState<{latitude: number, longitude: number, accuracy: number} | null>(null);
   const [gyroData, setGyroData] = useState<{x: number, y: number, z: number} | null>(null);
   
+  // Generate persistent deviceId for this session
+  const [deviceId] = useState<string>(() => uuid.v4().toString());
+  
+  // Log device info for debugging
+  useEffect(() => {
+    console.log('🔧 Heimdall Cam - Session Configuration:');
+    console.log(`  Device ID: ${deviceId}`);
+    console.log(`  Optimized for: Low memory usage, 10-second segments`);
+    console.log(`  Video Quality: 720p max, 30fps max, 2Mbps bitrate`);
+    console.log(`  File Organization: devices/${deviceId}/sessions/${sessionId}/chunks/`);
+  }, [deviceId]);
+  
   const recordingTimer = useRef<NodeJS.Timeout | null>(null);
   const isSegmentProcessing = useRef(false);
   const gyroSubscription = useRef<{remove: () => void} | null>(null);
@@ -144,6 +156,38 @@ const currentChunkIndex = useRef(0);
   const devices = useCameraDevices();
   const device = devices.find(device => device.position === 'back');
 
+  // Select optimal format for lower memory usage and framerate
+  const getOptimalFormat = () => {
+    if (!device || !device.formats) return null;
+    
+    // Find formats with lower resolution (720p or 480p) and lower framerate
+    const optimalFormats = device.formats.filter(format => {
+      const resolution = format.videoWidth * format.videoHeight;
+      const hasLowFramerate = format.maxFps <= 30;
+      
+      // Prefer 720p (1280x720) or lower with max 30fps
+      return resolution <= (1280 * 720) && hasLowFramerate;
+    });
+    
+    // Sort by lowest resolution first for memory efficiency
+    return optimalFormats.sort((a, b) => {
+      const aResolution = a.videoWidth * a.videoHeight;
+      const bResolution = b.videoWidth * b.videoHeight;
+      return aResolution - bResolution;
+    })[0] || device.formats[0]; // Fallback to first available format
+  };
+
+  const selectedFormat = getOptimalFormat();
+
+  // Log the selected format for debugging
+  useEffect(() => {
+    if (selectedFormat) {
+      console.log('📹 Camera optimized for low memory usage:');
+      console.log(`  Resolution: ${selectedFormat.videoWidth}x${selectedFormat.videoHeight}`);
+      console.log(`  Max FPS: ${selectedFormat.maxFps}`);
+      console.log(`  Video Stabilization: ${selectedFormat.videoStabilizationModes?.length > 0 ? 'Available' : 'Not available'}`);
+    }
+  }, [selectedFormat]);
 
 
 function getMimeType(ext: string) {
@@ -213,7 +257,7 @@ const uploadVideoChunk = async (videoPath: string, metadata: RecordingMetadata) 
     currentChunkIndex.current += 1;
     
     return result;
-  } catch (error) {
+    } catch (error) {
     console.error('Video upload failed:', error);
     throw error;
   }
@@ -277,7 +321,7 @@ const blobToBase64 = (blob: Blob): Promise<string> => {
           PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION
         )) === 'granted';
       }
-    } else {
+      } else {
       // For iOS, you'll need to handle location permissions differently
       // This is a simplified version
       locationPermission = true;
@@ -364,7 +408,7 @@ const blobToBase64 = (blob: Blob): Promise<string> => {
     const { scale, fontScale } = Dimensions.get('screen');
     
     return {
-      deviceId: uuid.v4(), // You might want to use a library like react-native-device-info to get a unique ID
+      deviceId: deviceId, // Use the persistent deviceId
       timestamp: new Date().toISOString(),
       location: location || undefined,
       deviceInfo: getDeviceInfo(),
@@ -386,8 +430,8 @@ const blobToBase64 = (blob: Blob): Promise<string> => {
       gyro: gyroData || undefined,
       recordingSettings: {
         codec: 'h264',
-        quality: '480p',
-        bitrate: 8000000, // 8 Mbps
+        quality: '360p', // Reduced from 480p for lower memory usage
+        bitrate: 2000000, // Reduced from 8Mbps to 2Mbps for smaller files
       },
     };
   };
@@ -427,8 +471,8 @@ const blobToBase64 = (blob: Blob): Promise<string> => {
         Alert.alert('Backend Error', response.error);
         setUploadStatus('Backend error: ' + response.error);
         setIsRecording(false);
-        return;
-      }
+      return;
+    }
       setSessionId(response.sessionId);
       setUploadStatus('Recording started');
       
@@ -489,7 +533,7 @@ const blobToBase64 = (blob: Blob): Promise<string> => {
     isSegmentProcessing.current = true;
     try {
       if (camera.current) {
-        await camera.current.stopRecording();
+          await camera.current.stopRecording();
         // onRecordingFinished will handle the upload
         // A small delay helps prevent race conditions
         setTimeout(() => {
@@ -511,7 +555,7 @@ const blobToBase64 = (blob: Blob): Promise<string> => {
   const handleStopRecording = async () => {
     if (!isRecording) return;
 
-    setIsRecording(false);
+      setIsRecording(false);
     setUploadStatus('Stopping...');
 
     // Clear the recording timer
@@ -560,7 +604,7 @@ const blobToBase64 = (blob: Blob): Promise<string> => {
         console.log('Backend health:', response);
       } catch (error) {
         console.warn('Backend not available:', error);
-        Alert.alert(
+    Alert.alert(
           'Backend Unavailable',
           'Please make sure the Node.js backend is running on port 3001',
           [{ text: 'OK' }]
@@ -611,6 +655,7 @@ const blobToBase64 = (blob: Blob): Promise<string> => {
         ref={camera}
         style={StyleSheet.absoluteFill}
         device={device}
+        format={selectedFormat || undefined}
         isActive={true}
         video={true}
         audio={true}
@@ -623,16 +668,16 @@ const blobToBase64 = (blob: Blob): Promise<string> => {
             <Text style={styles.sessionText}>Session: {sessionId.substring(0, 8)}</Text>
           )}
         </View>
-        
+
         {/* Recording controls */}
         <View style={styles.buttonContainer}>
           {!isRecording ? (
-            <TouchableOpacity
+        <TouchableOpacity
               style={[styles.button, styles.recordButton]}
               onPress={handleStartRecording}
             >
               <Text style={styles.buttonText}>Record</Text>
-            </TouchableOpacity>
+        </TouchableOpacity>
           ) : (
             <TouchableOpacity
               style={[styles.button, styles.stopButton]}
