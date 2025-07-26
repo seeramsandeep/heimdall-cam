@@ -30,7 +30,7 @@ import uuid from 'react-native-uuid';
 // const BACKEND_URL = 'http://10.0.2.2:3001'; // Change this to your backend URL
 
 // Ngrok URL
-const BACKEND_URL = 'https://225b41611b63.ngrok-free.app'; // Change this to your backend URL
+const BACKEND_URL = 'https://4938509f2d05.ngrok-free.app'; // Change this to your backend URL
 
 // API functions
 const apiCall = async (endpoint: string, method: string = 'GET', body?: any) => {

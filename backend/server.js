@@ -471,15 +471,22 @@ async function uploadTempFilesToGCP() {
 // Start periodic temp file monitoring
 function startTempFileMonitoring() {
   if (GCS_ENABLED) {
-    console.log('🔄 Starting temp file monitoring (every 2 seconds)');
+    console.log('🔄 Starting temp file monitoring (every 3 seconds)');
     
     // Initial upload
     uploadTempFilesToGCP();
     
-    // Set up periodic monitoring
-    setInterval(() => {
-      uploadTempFilesToGCP();
-    }, 2000); // Check every 2 seconds for faster chunk processing
+    // Set up periodic monitoring with better logging
+    setInterval(async () => {
+      try {
+        const result = await uploadTempFilesToGCP();
+        if (result && (result.successful > 0 || result.failed > 0)) {
+          console.log(`📊 Temp monitoring: ${result.successful || 0} uploaded, ${result.failed || 0} failed`);
+        }
+      } catch (error) {
+        console.error('❌ Temp file monitoring error:', error.message);
+      }
+    }, 3000); // Check every 3 seconds
   }
 }
 
@@ -632,59 +639,76 @@ app.post('/upload-chunk', upload.fields([
       session.lastChunkTime = new Date();
     }
 
-    // Save metadata alongside video file in temp for batch processing
-    const metadataPath = videoFile.path + '.metadata.json';
-    await fs.writeFile(metadataPath, JSON.stringify({
+    // Generate GCS path
+    const timestamp = Math.floor(Date.now() / 1000);
+    const gcsPath = `devices/${deviceId}/${timestamp}.mp4`;
+    
+    // 1. Move to permanent storage immediately (for backup)
+    const permanentPath = await moveToUploads(videoFile.path, sessionId, chunkIndex, deviceId);
+    
+    // 2. Upload to GCS immediately using the temp file
+    const gcsResult = await uploadToGCPImmediately(videoFile.path, gcsPath, {
       ...metadata,
       uploadId,
       sessionId,
       chunkIndex,
       deviceId,
-      timestamp: new Date().toISOString(),
-      originalVideoPath: videoFile.path
-    }));
-
-    // Move to permanent storage immediately (for backup)
-    const permanentPath = await moveToUploads(videoFile.path, sessionId, chunkIndex, deviceId);
+      timestamp: new Date().toISOString()
+    });
     
-    // Store upload info for session tracking
+    // 3. Store upload info for session tracking
     if (activeSessions.has(sessionId)) {
       const session = activeSessions.get(sessionId);
       session.uploads = session.uploads || [];
       session.uploads.push({
         uploadId,
         chunkIndex,
-        tempPath: videoFile.path,
+        gcsUri: gcsResult.success ? gcsResult.gcsUri : null,
+        presignedUrl: gcsResult.success ? gcsResult.presignedUrl : null,
+        expiresAt: gcsResult.success ? gcsResult.expiresAt : null,
         localPath: permanentPath,
-        metadataPath,
-        status: 'pending_gcs_upload',
+        uploadStatus: gcsResult.success ? 'completed' : 'failed',
+        gcsError: gcsResult.success ? null : gcsResult.error,
         timestamp: new Date()
       });
     }
 
-    const totalDuration = Date.now() - startTime;
+    // 4. Clean up temp file after successful operations
+    await cleanupTempFile(videoFile.path);
     
-    console.log(`✅ Upload [${uploadId}] queued for GCS upload in ${totalDuration}ms`);
-    console.log(`   📁 Local Storage: ✅`);
-    console.log(`   📋 Metadata Saved: ✅`);
-    console.log(`   ⏳ GCS Upload: Queued for batch processing`);
-
-    // Clean up metadata temp file from multer
+    // 5. Clean up metadata temp file from multer
     if (metadataFile) {
       await cleanupTempFile(metadataFile.path);
     }
 
-    // Send response immediately - GCS upload will happen via temp monitoring
+    const totalDuration = Date.now() - startTime;
+    
+    console.log(`✅ Upload [${uploadId}] completed in ${totalDuration}ms`);
+    console.log(`   📁 Local Storage: ✅ ${permanentPath}`);
+    console.log(`   📤 GCS Upload: ${gcsResult.success ? '✅' : '❌'} ${gcsResult.success ? gcsResult.gcsUri : gcsResult.error}`);
+    if (gcsResult.success) {
+      console.log(`   🔗 Presigned URL: ✅ (48h validity)`);
+    }
+
+    // Send response with all upload details
     res.json({
       success: true,
       uploadId,
       sessionId,
       chunkIndex,
       localPath: permanentPath,
+      gcsUpload: {
+        success: gcsResult.success,
+        gcsUri: gcsResult.success ? gcsResult.gcsUri : null,
+        presignedUrl: gcsResult.success ? gcsResult.presignedUrl : null,
+        expiresAt: gcsResult.success ? gcsResult.expiresAt : null,
+        error: gcsResult.success ? null : gcsResult.error
+      },
       processingTime: totalDuration,
       timestamp: new Date().toISOString(),
-      message: 'Video chunk received, GCS upload in progress',
-      status: 'pending_gcs_upload'
+      message: gcsResult.success ? 
+        'Video chunk uploaded successfully to GCS with 48h access URL' : 
+        'Video chunk saved locally but GCS upload failed'
     });
 
   } catch (error) {
@@ -1203,6 +1227,52 @@ app.get('/debug/status', (req, res) => {
     },
     server: 'Heimdall Security System v3.0'
   });
+});
+
+// Upload queue status endpoint
+app.get('/api/upload-status', async (req, res) => {
+  try {
+    // Count temp files
+    let tempFileCount = 0;
+    try {
+      const tempFiles = await fs.readdir(TEMP_DIR);
+      tempFileCount = tempFiles.filter(f => 
+        f.endsWith('.mp4') || f.endsWith('.mov') || f.endsWith('.mkv')
+      ).length;
+    } catch (error) {
+      console.warn('Could not read temp directory:', error.message);
+    }
+
+    // Get session upload stats
+    const allSessions = Array.from(activeSessions.values());
+    const allUploads = allSessions.flatMap(session => session.uploads || []);
+    
+    const uploadStats = {
+      completed: allUploads.filter(u => u.uploadStatus === 'completed').length,
+      failed: allUploads.filter(u => u.uploadStatus === 'failed').length,
+      pending: allUploads.filter(u => u.uploadStatus === 'pending_gcs_upload').length,
+      total: allUploads.length
+    };
+
+    res.json({
+      success: true,
+      timestamp: new Date().toISOString(),
+      tempFiles: tempFileCount,
+      uploads: uploadStats,
+      services: {
+        gcs: GCS_ENABLED,
+        videoAI: VIDEO_AI_ENABLED
+      },
+      activeSessions: activeSessions.size
+    });
+
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: error.message,
+      timestamp: new Date().toISOString()
+    });
+  }
 });
 
 // Debug endpoint for temp directory and upload status
