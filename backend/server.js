@@ -10,6 +10,36 @@ const { v4: uuidv4 } = require('uuid');
 const http = require('http');
 const socketIo = require('socket.io');
 
+
+
+const admin = require('firebase-admin'); // ✅ required
+
+let firebaseApp;
+let FIREBASE_ENABLED = false;
+
+try {
+  let firebaseCredentials;
+
+  if (process.env.FIREBASE_CREDENTIALS_JSON) {
+    firebaseCredentials = JSON.parse(process.env.FIREBASE_CREDENTIALS_JSON);
+  } else {
+    firebaseCredentials = require('./firebase-service-account.json'); // or your actual path
+  }
+
+  firebaseApp = admin.initializeApp({
+    credential: admin.credential.cert(firebaseCredentials),
+    storageBucket: process.env.FIREBASE_STORAGE_BUCKET,
+    databaseURL: process.env.FIREBASE_DATABASE_URL
+  });
+
+  FIREBASE_ENABLED = true;
+  console.log("✅ Firebase initialized");
+} catch (error) {
+  console.warn("⚠️ Firebase not initialized:", error.message);
+}
+
+
+
 // Import the new video intelligence API router
 const videoIntelligenceRouter = require('./video-intelligence-api');
 
