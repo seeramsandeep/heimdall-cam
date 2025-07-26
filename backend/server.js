@@ -8,6 +8,9 @@ const videoIntelligence = require('@google-cloud/video-intelligence').v1;
 const cors = require('cors');
 const { v4: uuidv4 } = require('uuid');
 
+// Import the new video intelligence API router
+const videoIntelligenceRouter = require('./video-intelligence-api');
+
 const app = express();
 
 // Configuration
@@ -112,6 +115,9 @@ app.use((req, res, next) => {
 });
 
 app.use(express.json());
+
+// Mount the video intelligence API router
+app.use('/api/video-intelligence', videoIntelligenceRouter);
 
 // Multer configuration for temporary file storage
 const upload = multer({
