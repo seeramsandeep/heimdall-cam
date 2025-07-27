@@ -12,6 +12,9 @@ import {
   Dimensions,
   NativeModules,
   NativeEventEmitter,
+  StatusBar,
+  SafeAreaView,
+  ScrollView,
 } from 'react-native';
 import {
   Camera,
@@ -23,14 +26,8 @@ import RNFS from 'react-native-fs';
 import 'react-native-get-random-values';
 import uuid from 'react-native-uuid';
 
-
 // Backend API configuration
-// const BACKEND_URL = 'http://localhost:3001'; // Change this to your backend URL
-// const BACKEND_URL = 'http://192.168.1.100:3001'; // Change this to your backend URL
-// const BACKEND_URL = 'http://10.0.2.2:3001'; // Change this to your backend URL
-
-// Ngrok URL
-const BACKEND_URL = 'https://4938509f2d05.ngrok-free.app'; // Change this to your backend URL
+const BACKEND_URL = 'https://74ceb071ec36.ngrok-free.app';
 
 // API functions
 const apiCall = async (endpoint: string, method: string = 'GET', body?: any) => {
@@ -49,32 +46,6 @@ const apiCall = async (endpoint: string, method: string = 'GET', body?: any) => 
   }
 };
 
-// const uploadVideoChunk = async (videoPath: string) => {
-//   try {
-//     const formData = new FormData();
-//     formData.append('video', {
-//       uri: videoPath,
-//       type: 'video/mp4',
-//       name: `video_${Date.now()}.mp4`,
-//     } as any);
-
-//     const response = await fetch(`${BACKEND_URL}/upload-chunk`, {
-//       method: 'POST',
-//       // headers: {
-//       //   'Content-Type': 'multipart/form-data',
-//       // },
-//       body: formData,
-//     });
-
-//     return await response.json();
-//   } catch (error) {
-//     console.error('Video upload failed:', error);
-//     throw error;
-//   }
-// };
-
-
-
 // Types for metadata
 interface RecordingMetadata {
   deviceId: string;
@@ -92,7 +63,7 @@ interface RecordingMetadata {
   };
   cameraInfo: {
     id: string;
-    position: string; // Can be 'front', 'back', or 'external'
+    position: string;
     resolution: {
       width: number;
       height: number;
@@ -119,8 +90,7 @@ interface RecordingMetadata {
 
 export default function App() {
   const camera = useRef<CameraType>(null);
-  // Track the current chunk index
-const currentChunkIndex = useRef(0);
+  const currentChunkIndex = useRef(0);
   const [hasPermission, setHasPermission] = useState(false);
   const [showCamera, setShowCamera] = useState(false);
   const [showSplash, setShowSplash] = useState(true);
@@ -136,22 +106,17 @@ const currentChunkIndex = useRef(0);
   // Generate persistent deviceId for this session
   const [deviceId] = useState<string>(() => uuid.v4().toString());
   
-  // Log device info for debugging
-  useEffect(() => {
-    console.log('🔧 Heimdall Cam - Session Configuration:');
-    console.log(`  Device ID: ${deviceId}`);
-    console.log(`  Optimized for: Low memory usage, 10-second segments`);
-    console.log(`  Video Quality: 720p max, 30fps max, 2Mbps bitrate`);
-    console.log(`  File Organization: devices/${deviceId}/sessions/${sessionId}/chunks/`);
-  }, [deviceId]);
+  // Animation values
+  const pulseAnim = useRef(new Animated.Value(1)).current;
+  const fadeAnim = useRef(new Animated.Value(0)).current;
+  const slideAnim = useRef(new Animated.Value(50)).current;
+  const recordPulseAnim = useRef(new Animated.Value(1)).current;
+  const statusFadeAnim = useRef(new Animated.Value(0)).current;
   
   const recordingTimer = useRef<NodeJS.Timeout | null>(null);
   const isSegmentProcessing = useRef(false);
   const gyroSubscription = useRef<{remove: () => void} | null>(null);
   const locationSubscription = useRef<{remove: () => void} | null>(null);
-
-  // Animation for the "Open Camera" button
-  const pulseAnim = useRef(new Animated.Value(1)).current;
 
   const devices = useCameraDevices();
   const device = devices.find(device => device.position === 'back');
@@ -160,24 +125,29 @@ const currentChunkIndex = useRef(0);
   const getOptimalFormat = () => {
     if (!device || !device.formats) return null;
     
-    // Find formats with lower resolution (720p or 480p) and lower framerate
     const optimalFormats = device.formats.filter(format => {
       const resolution = format.videoWidth * format.videoHeight;
       const hasLowFramerate = format.maxFps <= 30;
-      
-      // Prefer 720p (1280x720) or lower with max 30fps
       return resolution <= (1280 * 720) && hasLowFramerate;
     });
     
-    // Sort by lowest resolution first for memory efficiency
     return optimalFormats.sort((a, b) => {
       const aResolution = a.videoWidth * a.videoHeight;
       const bResolution = b.videoWidth * b.videoHeight;
       return aResolution - bResolution;
-    })[0] || device.formats[0]; // Fallback to first available format
+    })[0] || device.formats[0];
   };
 
   const selectedFormat = getOptimalFormat();
+
+  // Log device info for debugging
+  useEffect(() => {
+    console.log('🔧 Heimdall Cam - Session Configuration:');
+    console.log(`  Device ID: ${deviceId}`);
+    console.log(`  Optimized for: Low memory usage, 10-second segments`);
+    console.log(`  Video Quality: 720p max, 30fps max, 2Mbps bitrate`);
+    console.log(`  File Organization: devices/${deviceId}/sessions/${sessionId}/chunks/`);
+  }, [deviceId]);
 
   // Log the selected format for debugging
   useEffect(() => {
@@ -189,128 +159,188 @@ const currentChunkIndex = useRef(0);
     }
   }, [selectedFormat]);
 
-
-function getMimeType(ext: string) {
-  switch (ext.toLowerCase()) {
-    case 'mp4':
-      return 'video/mp4';
-    case 'mov':
-      return 'video/quicktime';
-    case 'mkv':
-      return 'video/x-matroska';
-    default:
-      return 'application/octet-stream';
+  function getMimeType(ext: string) {
+    switch (ext.toLowerCase()) {
+      case 'mp4':
+        return 'video/mp4';
+      case 'mov':
+        return 'video/quicktime';
+      case 'mkv':
+        return 'video/x-matroska';
+      default:
+        return 'application/octet-stream';
+    }
   }
-}
 
-const uploadVideoChunk = async (videoPath: string, metadata: RecordingMetadata) => {
-  try {
-    const ext = videoPath.split('.').pop() || 'mov';
-    const mimeType = getMimeType(ext);
-    const timestamp = new Date().toISOString();
-    const chunkIndex = currentChunkIndex.current;
+  const uploadVideoChunk = async (videoPath: string, metadata: RecordingMetadata) => {
+    try {
+      const ext = videoPath.split('.').pop() || 'mov';
+      const mimeType = getMimeType(ext);
+      const timestamp = new Date().toISOString();
+      const chunkIndex = currentChunkIndex.current;
 
-    const formData = new FormData();
-    
-    // Append video file
-    formData.append('video', {
-      uri: Platform.OS === 'android' ? 'file://' + videoPath : videoPath,
-      type: mimeType,
-      name: `video_${Date.now()}.${ext}`,
-    } as any);
-    
-    // Append metadata as a JSON string
-    const metadataBlob = new Blob(
-      [JSON.stringify({
-        ...metadata,
-        chunkTimestamp: timestamp,
-        chunkIndex: chunkIndex,
-      })],
-      { 
-        type: 'application/json',
-        // @ts-ignore - BlobOptions type is not fully compatible with React Native
-        lastModified: Date.now()
-      }
-    );
-    
-    formData.append('metadata', {
-      uri: `data:application/json;base64,${await blobToBase64(metadataBlob)}`,
-      type: 'application/json',
-      name: 'metadata.json',
-    } as any);
-
-    console.log(`Uploading chunk ${chunkIndex} with metadata:`, 
-      JSON.stringify(metadata, null, 2));
+      const formData = new FormData();
       
-    const response = await fetch(`${BACKEND_URL}/upload-chunk`, {
-      method: 'POST',
-      body: formData,
-      headers: {
-        'Content-Type': 'multipart/form-data',
-      },
+      formData.append('video', {
+        uri: Platform.OS === 'android' ? 'file://' + videoPath : videoPath,
+        type: mimeType,
+        name: `video_${Date.now()}.${ext}`,
+      } as any);
+      
+      const metadataBlob = new Blob(
+        [JSON.stringify({
+          ...metadata,
+          chunkTimestamp: timestamp,
+          chunkIndex: chunkIndex,
+        })],
+        { 
+          type: 'application/json',
+          // @ts-ignore - BlobOptions type is not fully compatible with React Native
+          lastModified: Date.now()
+        }
+      );
+      
+      formData.append('metadata', {
+        uri: `data:application/json;base64,${await blobToBase64(metadataBlob)}`,
+        type: 'application/json',
+        name: 'metadata.json',
+      } as any);
+
+      console.log(`Uploading chunk ${chunkIndex} with metadata:`, 
+        JSON.stringify(metadata, null, 2));
+        
+      const response = await fetch(`${BACKEND_URL}/upload-chunk`, {
+        method: 'POST',
+        body: formData,
+        headers: {
+          'Content-Type': 'multipart/form-data',
+        },
+      });
+
+      const result = await response.json();
+      console.log(`Chunk ${chunkIndex} upload response:`, result);
+      
+      currentChunkIndex.current += 1;
+      
+      return result;
+      } catch (error) {
+      console.error('Video upload failed:', error);
+      throw error;
+    }
+  };
+
+  // Helper function to convert Blob to base64
+  const blobToBase64 = (blob: Blob): Promise<string> => {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => {
+        const base64String = (reader.result as string).split(',')[1];
+        resolve(base64String);
+      };
+      reader.onerror = reject;
+      reader.readAsDataURL(blob);
     });
+  };
 
-    const result = await response.json();
-    console.log(`Chunk ${chunkIndex} upload response:`, result);
-    
-    // Increment chunk index for next upload
-    currentChunkIndex.current += 1;
-    
-    return result;
-    } catch (error) {
-    console.error('Video upload failed:', error);
-    throw error;
-  }
-};
-
-// Helper function to convert Blob to base64
-const blobToBase64 = (blob: Blob): Promise<string> => {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => {
-      const base64String = (reader.result as string).split(',')[1];
-      resolve(base64String);
-    };
-    reader.onerror = reject;
-    reader.readAsDataURL(blob);
-  });
-};
-
-  // Splash screen effect
+  // Enhanced splash screen with animations
   useEffect(() => {
-    const timer = setTimeout(() => setShowSplash(false), 2000); // 2 seconds splash
+    const timer = setTimeout(() => {
+      Animated.parallel([
+        Animated.timing(fadeAnim, {
+          toValue: 0,
+          duration: 800,
+          useNativeDriver: true,
+          easing: Easing.out(Easing.cubic),
+        }),
+        Animated.timing(slideAnim, {
+          toValue: -100,
+          duration: 800,
+          useNativeDriver: true,
+          easing: Easing.out(Easing.cubic),
+        }),
+      ]).start(() => setShowSplash(false));
+    }, 2500);
+
     return () => clearTimeout(timer);
   }, []);
 
-  // Button pulse animation
+  // Enhanced button animations
   useEffect(() => {
     if (!showSplash && !showCamera) {
+      // Fade in main screen
+      Animated.timing(fadeAnim, {
+        toValue: 1,
+        duration: 1000,
+        useNativeDriver: true,
+        easing: Easing.out(Easing.cubic),
+      }).start();
+
+      // Slide up main content
+      Animated.timing(slideAnim, {
+        toValue: 0,
+        duration: 1000,
+        useNativeDriver: true,
+        easing: Easing.out(Easing.cubic),
+      }).start();
+
+      // Pulse animation for main button
       Animated.loop(
         Animated.sequence([
           Animated.timing(pulseAnim, {
-            toValue: 1.15,
-            duration: 700,
+            toValue: 1.1,
+            duration: 1500,
             useNativeDriver: true,
             easing: Easing.inOut(Easing.ease),
           }),
           Animated.timing(pulseAnim, {
             toValue: 1,
-            duration: 700,
+            duration: 1500,
             useNativeDriver: true,
             easing: Easing.inOut(Easing.ease),
           }),
         ])
       ).start();
     }
-  }, [showSplash, showCamera, pulseAnim]);
+  }, [showSplash, showCamera, pulseAnim, fadeAnim, slideAnim]);
+
+  // Recording pulse animation
+  useEffect(() => {
+    if (isRecording) {
+      Animated.loop(
+        Animated.sequence([
+          Animated.timing(recordPulseAnim, {
+            toValue: 1.2,
+            duration: 600,
+            useNativeDriver: true,
+            easing: Easing.inOut(Easing.ease),
+          }),
+          Animated.timing(recordPulseAnim, {
+            toValue: 1,
+            duration: 600,
+            useNativeDriver: true,
+            easing: Easing.inOut(Easing.ease),
+          }),
+        ])
+      ).start();
+    } else {
+      recordPulseAnim.setValue(1);
+    }
+  }, [isRecording, recordPulseAnim]);
+
+  // Status fade animation
+  useEffect(() => {
+    Animated.timing(statusFadeAnim, {
+      toValue: 1,
+      duration: 500,
+      useNativeDriver: true,
+    }).start();
+  }, [uploadStatus, statusFadeAnim]);
 
   // Request all necessary permissions
   const requestPermissions = async () => {
-    // Camera and microphone permissions
     const cameraPermission: CameraPermissionStatus = await Camera.requestCameraPermission();
     const micPermission: CameraPermissionStatus = await Camera.requestMicrophonePermission();
     
-    // Location permission
     let locationPermission = false;
     if (Platform.OS === 'android') {
       locationPermission = await PermissionsAndroid.check(
@@ -322,8 +352,6 @@ const blobToBase64 = (blob: Blob): Promise<string> => {
         )) === 'granted';
       }
       } else {
-      // For iOS, you'll need to handle location permissions differently
-      // This is a simplified version
       locationPermission = true;
     }
 
@@ -349,8 +377,6 @@ const blobToBase64 = (blob: Blob): Promise<string> => {
   // Start gyroscope tracking
   const startGyroTracking = async () => {
     try {
-      // This is a simplified version - you'll need to implement or use a library
-      // like expo-sensors for cross-platform gyroscope support
       if (Platform.OS === 'android' && NativeModules.DeviceMotion) {
         const DeviceMotion = new NativeEventEmitter(NativeModules.DeviceMotion);
         gyroSubscription.current = DeviceMotion.addListener(
@@ -372,8 +398,6 @@ const blobToBase64 = (blob: Blob): Promise<string> => {
   // Start location tracking
   const startLocationTracking = async () => {
     try {
-      // This is a simplified version - you'll need to implement or use a library
-      // like expo-location for cross-platform location support
       if (Platform.OS === 'android' && NativeModules.LocationManager) {
         const LocationManager = new NativeEventEmitter(NativeModules.LocationManager);
         locationSubscription.current = LocationManager.addListener(
@@ -408,7 +432,7 @@ const blobToBase64 = (blob: Blob): Promise<string> => {
     const { scale, fontScale } = Dimensions.get('screen');
     
     return {
-      deviceId: deviceId, // Use the persistent deviceId
+      deviceId: deviceId,
       timestamp: new Date().toISOString(),
       location: location || undefined,
       deviceInfo: getDeviceInfo(),
@@ -430,8 +454,8 @@ const blobToBase64 = (blob: Blob): Promise<string> => {
       gyro: gyroData || undefined,
       recordingSettings: {
         codec: 'h264',
-        quality: '360p', // Reduced from 480p for lower memory usage
-        bitrate: 2000000, // Reduced from 8Mbps to 2Mbps for smaller files
+        quality: '360p',
+        bitrate: 2000000,
       },
     };
   };
@@ -449,14 +473,12 @@ const blobToBase64 = (blob: Blob): Promise<string> => {
   // Cleanup function for effects
   useEffect(() => {
     return () => {
-      // Clean up subscriptions
       if (gyroSubscription.current) {
         gyroSubscription.current.remove();
       }
       if (locationSubscription.current) {
         locationSubscription.current.remove();
       }
-      // Clean up any other resources
     };
   }, []);
 
@@ -465,7 +487,6 @@ const blobToBase64 = (blob: Blob): Promise<string> => {
     if (!camera.current) return;
     
     try {
-      // Start recording session on backend
       const response = await apiCall('/start-recording', 'POST');
       if (response.error) {
         Alert.alert('Backend Error', response.error);
@@ -478,13 +499,11 @@ const blobToBase64 = (blob: Blob): Promise<string> => {
       
       setIsRecording(true);
       
-      // Start recording with 10-second segments
       startRecordingSegment();
       
-      // Set up timer to create new segments every 10 seconds
       const timer = setInterval(() => {
         restartRecordingSegment();  
-      }, 10000); // 10 seconds
+      }, 10000);
       
       recordingTimer.current = timer;
       
@@ -497,22 +516,19 @@ const blobToBase64 = (blob: Blob): Promise<string> => {
   const startRecordingSegment = () => {
     if (!camera.current) return;
     
-    // Generate metadata for this recording segment
     const metadata = generateMetadata();
     
     camera.current.startRecording({
-      fileType: 'mp4', // Ensures .mp4 output
+      fileType: 'mp4',
       onRecordingFinished: async (video) => {
         console.log('Video segment saved to:', video.path);
         
         try {
-          // Upload video chunk to backend with metadata
           setUploadStatus('Uploading...');
           const uploadResponse = await uploadVideoChunk(video.path, metadata);
           console.log('Video uploaded:', uploadResponse);
           setUploadStatus('Uploaded successfully');
           
-          // Clean up local file after upload
           await RNFS.unlink(video.path);
           
         } catch (error) {
@@ -534,8 +550,6 @@ const blobToBase64 = (blob: Blob): Promise<string> => {
     try {
       if (camera.current) {
           await camera.current.stopRecording();
-        // onRecordingFinished will handle the upload
-        // A small delay helps prevent race conditions
         setTimeout(() => {
           startRecordingSegment();
         }, 250);
@@ -544,7 +558,6 @@ const blobToBase64 = (blob: Blob): Promise<string> => {
       console.error('Error restarting recording segment:', error);
       setUploadStatus('Error restarting');
     } finally {
-      // Reset lock after a short delay to allow the next segment to start
       setTimeout(() => {
         isSegmentProcessing.current = false;
       }, 500);
@@ -558,19 +571,16 @@ const blobToBase64 = (blob: Blob): Promise<string> => {
       setIsRecording(false);
     setUploadStatus('Stopping...');
 
-    // Clear the recording timer
     if (recordingTimer.current) {
       clearInterval(recordingTimer.current);
       recordingTimer.current = null;
     }
 
     try {
-      // Stop the camera hardware recording
       if (camera.current) {
         await camera.current.stopRecording();
       }
 
-      // Notify the backend to stop the session
       const response = await apiCall('/stop-recording', 'POST');
       console.log('Stop recording response:', response);
       setUploadStatus('Stopped');
@@ -617,40 +627,98 @@ const blobToBase64 = (blob: Blob): Promise<string> => {
     }
   }, [showSplash]);
 
-  // Splash screen
+  // Enhanced splash screen
   if (showSplash) {
     return (
-      <View style={styles.splashScreen}>
-        <Text style={styles.splashText}>Heimdall Cam</Text>
-      </View>
+      <SafeAreaView style={styles.splashContainer}>
+        <StatusBar barStyle="light-content" backgroundColor="#1a1a2e" />
+        <Animated.View 
+          style={[
+            styles.splashContent,
+            {
+              opacity: fadeAnim,
+              transform: [{ translateY: slideAnim }]
+            }
+          ]}
+        >
+          <View style={styles.logoContainer}>
+            <View style={styles.logoCircle}>
+              <Text style={styles.logoText}>HC</Text>
+            </View>
+          </View>
+          <Text style={styles.splashTitle}>Heimdall Cam</Text>
+          <Text style={styles.splashSubtitle}>Professional Video Recording</Text>
+          <View style={styles.loadingDots}>
+            <View style={[styles.dot, styles.dot1]} />
+            <View style={[styles.dot, styles.dot2]} />
+            <View style={[styles.dot, styles.dot3]} />
+          </View>
+        </Animated.View>
+      </SafeAreaView>
     );
   }
 
-  // Main screen with animated "Open Camera" button
+  // Enhanced main screen
   if (!showCamera) {
     return (
-      <View style={styles.mainScreen}>
-        <Text style={styles.title}>Heimdall Cam</Text>
-        <Animated.View style={{ transform: [{ scale: pulseAnim }] }}>
-          <TouchableOpacity style={styles.openButton} onPress={handleOpenCamera}>
-            <Text style={styles.buttonText}>Open Camera</Text>
-          </TouchableOpacity>
+      <SafeAreaView style={styles.mainContainer}>
+        <StatusBar barStyle="light-content" backgroundColor="#1a1a2e" />
+        <Animated.View 
+          style={[
+            styles.mainContent,
+            {
+              opacity: fadeAnim,
+              transform: [{ translateY: slideAnim }]
+            }
+          ]}
+        >
+          <View style={styles.header}>
+            <View style={styles.logoContainer}>
+              <View style={styles.logoCircle}>
+                <Text style={styles.logoText}>HC</Text>
+              </View>
+            </View>
+            <Text style={styles.mainTitle}>Heimdall Cam</Text>
+            <Text style={styles.mainSubtitle}>Professional Video Recording</Text>
+          </View>
+
+          <Animated.View style={{ transform: [{ scale: pulseAnim }] }}>
+            <TouchableOpacity style={styles.openButton} onPress={handleOpenCamera}>
+              <Text style={styles.buttonText}>Start Recording</Text>
+            </TouchableOpacity>
+          </Animated.View>
+
+          <View style={styles.footer}>
+            <View style={styles.deviceInfo}>
+              <Text style={styles.deviceLabel}>Device ID</Text>
+              <Text style={styles.deviceValue}>{deviceId.substring(0, 8)}</Text>
+            </View>
+          </View>
         </Animated.View>
-      </View>
+      </SafeAreaView>
     );
   }
 
-  // Camera screen with "Record" or "Stop" button
+  // Enhanced loading screen
   if (!device || !hasPermission) {
     return (
-      <View style={styles.loading}>
-        <Text style={{ color: 'white' }}>Loading camera...</Text>
-      </View>
+      <SafeAreaView style={styles.loadingContainer}>
+        <StatusBar barStyle="light-content" backgroundColor="#1a1a2e" />
+        <View style={styles.loadingContent}>
+          <View style={styles.loadingSpinner}>
+            <View style={styles.spinnerRing} />
+            <Text style={styles.loadingText}>📹</Text>
+          </View>
+          <Text style={styles.loadingTitle}>Initializing Camera</Text>
+          <Text style={styles.loadingSubtitle}>Please wait...</Text>
+        </View>
+      </SafeAreaView>
     );
   }
 
   return (
-    <View style={styles.container}>
+    <SafeAreaView style={styles.cameraContainer}>
+      <StatusBar barStyle="light-content" backgroundColor="#000000" />
       <Camera
         ref={camera}
         style={StyleSheet.absoluteFill}
@@ -660,132 +728,394 @@ const blobToBase64 = (blob: Blob): Promise<string> => {
         video={true}
         audio={true}
       />
-      <View style={styles.controls}>
-        {/* Status indicator */}
-        <View style={styles.statusContainer}>
+      
+      {/* Enhanced top status bar */}
+      <View style={styles.cameraTopBar}>
+        <Animated.View 
+          style={[
+            styles.statusIndicator,
+            { opacity: statusFadeAnim }
+          ]}
+        >
+          <View style={[
+            styles.statusDot,
+            { backgroundColor: uploadStatus.includes('error') ? '#e74c3c' : 
+                           uploadStatus.includes('Uploaded') ? '#27ae60' : 
+                           uploadStatus.includes('Recording') ? '#f39c12' : '#95a5a6' }
+          ]} />
           <Text style={styles.statusText}>{uploadStatus}</Text>
-          {sessionId && (
-            <Text style={styles.sessionText}>Session: {sessionId.substring(0, 8)}</Text>
-          )}
-        </View>
+        </Animated.View>
+        
+        {sessionId && (
+          <View style={styles.sessionInfo}>
+            <Text style={styles.sessionLabel}>Session</Text>
+            <Text style={styles.sessionText}>{sessionId.substring(0, 8)}</Text>
+          </View>
+        )}
+      </View>
 
-        {/* Recording controls */}
-        <View style={styles.buttonContainer}>
+      {/* Enhanced recording indicator */}
+      {isRecording && (
+        <Animated.View 
+          style={[
+            styles.recordingIndicator,
+            { transform: [{ scale: recordPulseAnim }] }
+          ]}
+        >
+          <View style={styles.recordingDot} />
+          <Text style={styles.recordingText}>REC</Text>
+        </Animated.View>
+      )}
+
+      {/* Enhanced camera controls */}
+      <View style={styles.cameraControls}>
+        <View style={styles.controlButtons}>
           {!isRecording ? (
-        <TouchableOpacity
-              style={[styles.button, styles.recordButton]}
+            <TouchableOpacity
+              style={[styles.controlButton, styles.recordButton]}
               onPress={handleStartRecording}
             >
-              <Text style={styles.buttonText}>Record</Text>
-        </TouchableOpacity>
+              <View style={styles.buttonInner}>
+                <Text style={styles.buttonLabel}>Record</Text>
+              </View>
+            </TouchableOpacity>
           ) : (
             <TouchableOpacity
-              style={[styles.button, styles.stopButton]}
+              style={[styles.controlButton, styles.stopButton]}
               onPress={handleStopRecording}
             >
-              <Text style={styles.buttonText}>Stop</Text>
+              <View style={styles.buttonInner}>
+                <Text style={styles.buttonLabel}>Stop</Text>
+              </View>
             </TouchableOpacity>
           )}
+          
           {!isRecording && (
             <TouchableOpacity
-              style={[styles.button, styles.closeButton]}
+              style={[styles.controlButton, styles.closeButton]}
               onPress={handleCloseCamera}
             >
-              <Text style={styles.buttonText}>Close</Text>
+              <View style={styles.buttonInner}>
+                <Text style={styles.buttonLabel}>Close</Text>
+              </View>
             </TouchableOpacity>
           )}
         </View>
       </View>
-    </View>
+    </SafeAreaView>
   );
 }
 
 const styles = StyleSheet.create({
-  splashScreen: {
+  // Enhanced Splash Screen Styles
+  splashContainer: {
     flex: 1,
-    backgroundColor: '#111',
+    backgroundColor: '#1a1a2e',
+  },
+  splashContent: {
+    flex: 1,
     justifyContent: 'center',
     alignItems: 'center',
+    paddingHorizontal: 40,
   },
-  splashText: {
+  logoContainer: {
+    marginBottom: 30,
+  },
+  logoCircle: {
+    width: 140,
+    height: 140,
+    borderRadius: 70,
+    backgroundColor: '#4a90e2',
+    justifyContent: 'center',
+    alignItems: 'center',
+    shadowColor: '#4a90e2',
+    shadowOffset: { width: 0, height: 0 },
+    shadowOpacity: 0.4,
+    shadowRadius: 20,
+    elevation: 10,
+  },
+  logoText: {
     color: 'white',
-    fontSize: 38,
+    fontSize: 40,
     fontWeight: 'bold',
     letterSpacing: 2,
   },
-  mainScreen: {
-    flex: 1,
-    justifyContent: 'center',
-    alignItems: 'center',
-    backgroundColor: 'black',
-  },
-  title: {
+  splashTitle: {
     color: 'white',
-    fontSize: 32,
+    fontSize: 46,
     fontWeight: 'bold',
+    letterSpacing: 3,
+    marginBottom: 10,
+    textAlign: 'center',
+  },
+  splashSubtitle: {
+    color: '#b8c5d6',
+    fontSize: 20,
+    fontWeight: '300',
+    textAlign: 'center',
     marginBottom: 40,
   },
-  openButton: {
-    backgroundColor: 'red',
-    padding: 18,
-    borderRadius: 50,
-    minWidth: 180,
-    alignItems: 'center',
-  },
-  container: { flex: 1, backgroundColor: 'black' },
-  loading: {
-    flex: 1,
+  loadingDots: {
+    flexDirection: 'row',
     justifyContent: 'center',
     alignItems: 'center',
-    backgroundColor: 'black',
   },
-  controls: {
-    position: 'absolute',
-    bottom: 40,
-    alignSelf: 'center',
+  dot: {
+    width: 10,
+    height: 10,
+    borderRadius: 5,
+    backgroundColor: '#4a90e2',
+    marginHorizontal: 6,
+  },
+  dot1: { opacity: 0.3 },
+  dot2: { opacity: 0.6 },
+  dot3: { opacity: 1 },
+
+  // Enhanced Main Screen Styles
+  mainContainer: {
+    flex: 1,
+    backgroundColor: '#1a1a2e',
+  },
+  mainContent: {
+    flex: 1,
+    justifyContent: 'space-between',
     alignItems: 'center',
+    paddingHorizontal: 30,
+    paddingVertical: 40,
   },
-  statusContainer: {
-    backgroundColor: 'rgba(0, 0, 0, 0.7)',
-    padding: 10,
-    borderRadius: 10,
-    marginBottom: 20,
+  header: {
     alignItems: 'center',
+    marginTop: 40,
   },
-  statusText: {
+  mainTitle: {
     color: 'white',
-    fontSize: 14,
+    fontSize: 40,
     fontWeight: 'bold',
+    letterSpacing: 2,
+    marginBottom: 10,
+    textAlign: 'center',
   },
-  sessionText: {
-    color: '#ccc',
-    fontSize: 12,
-    marginTop: 4,
+  mainSubtitle: {
+    color: '#b8c5d6',
+    fontSize: 18,
+    fontWeight: '300',
+    textAlign: 'center',
+    lineHeight: 26,
   },
-  buttonContainer: {
-    flexDirection: 'row',
-    gap: 20,
-  },
-  button: {
-    backgroundColor: 'red',
-    padding: 18,
-    borderRadius: 50,
-    marginHorizontal: 10,
-    minWidth: 100,
+  openButton: {
+    backgroundColor: '#4a90e2',
+    paddingVertical: 18,
+    paddingHorizontal: 40,
+    borderRadius: 8,
+    minWidth: 200,
     alignItems: 'center',
-  },
-  recordButton: {
-    backgroundColor: 'red',
-  },
-  stopButton: {
-    backgroundColor: 'gray',
-  },
-  closeButton: {
-    backgroundColor: '#333',
+    shadowColor: '#4a90e2',
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.3,
+    shadowRadius: 8,
+    elevation: 6,
   },
   buttonText: {
     color: 'white',
     fontSize: 18,
+    fontWeight: '600',
+    letterSpacing: 0.5,
+  },
+  footer: {
+    marginBottom: 20,
+  },
+  deviceInfo: {
+    alignItems: 'center',
+    paddingHorizontal: 20,
+    paddingVertical: 10,
+    backgroundColor: 'rgba(255, 255, 255, 0.08)',
+    borderRadius: 20,
+    borderWidth: 1,
+    borderColor: 'rgba(255, 255, 255, 0.1)',
+  },
+  deviceLabel: {
+    color: '#95a5a6',
+    fontSize: 12,
+    fontWeight: '500',
+    marginBottom: 4,
+  },
+  deviceValue: {
+    color: '#ffffff',
+    fontSize: 14,
     fontWeight: 'bold',
+  },
+
+  // Enhanced Loading Screen Styles
+  loadingContainer: {
+    flex: 1,
+    backgroundColor: '#1a1a2e',
+  },
+  loadingContent: {
+    flex: 1,
+    justifyContent: 'center',
+    alignItems: 'center',
+    paddingHorizontal: 40,
+  },
+  loadingSpinner: {
+    width: 100,
+    height: 100,
+    borderRadius: 50,
+    justifyContent: 'center',
+    alignItems: 'center',
+    marginBottom: 30,
+    position: 'relative',
+  },
+  spinnerRing: {
+    position: 'absolute',
+    width: 100,
+    height: 100,
+    borderRadius: 50,
+    borderWidth: 3,
+    borderColor: 'rgba(74, 144, 226, 0.3)',
+    borderTopColor: '#4a90e2',
+  },
+  loadingText: {
+    fontSize: 36,
+  },
+  loadingTitle: {
+    color: 'white',
+    fontSize: 28,
+    fontWeight: 'bold',
+    marginBottom: 10,
+    textAlign: 'center',
+  },
+  loadingSubtitle: {
+    color: '#b8c5d6',
+    fontSize: 18,
+    textAlign: 'center',
+  },
+
+  // Enhanced Camera Screen Styles
+  cameraContainer: {
+    flex: 1,
+    backgroundColor: 'black',
+  },
+  cameraTopBar: {
+    position: 'absolute',
+    top: 0,
+    left: 0,
+    right: 0,
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    paddingHorizontal: 20,
+    paddingTop: 10,
+    paddingBottom: 15,
+    backgroundColor: 'rgba(26, 26, 46, 0.9)',
+  },
+  statusIndicator: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: 'rgba(0, 0, 0, 0.7)',
+    paddingHorizontal: 15,
+    paddingVertical: 8,
+    borderRadius: 25,
+    borderWidth: 1,
+    borderColor: 'rgba(255, 255, 255, 0.1)',
+  },
+  statusDot: {
+    width: 10,
+    height: 10,
+    borderRadius: 5,
+    marginRight: 10,
+  },
+  statusText: {
+    color: 'white',
+    fontSize: 14,
+    fontWeight: '600',
+  },
+  sessionInfo: {
+    backgroundColor: 'rgba(0, 0, 0, 0.7)',
+    paddingHorizontal: 15,
+    paddingVertical: 8,
+    borderRadius: 25,
+    borderWidth: 1,
+    borderColor: 'rgba(255, 255, 255, 0.1)',
+    alignItems: 'center',
+  },
+  sessionLabel: {
+    color: '#95a5a6',
+    fontSize: 10,
+    fontWeight: '500',
+    marginBottom: 2,
+  },
+  sessionText: {
+    color: '#ffffff',
+    fontSize: 12,
+    fontWeight: 'bold',
+  },
+  recordingIndicator: {
+    position: 'absolute',
+    top: 100,
+    right: 20,
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#e74c3c',
+    paddingHorizontal: 15,
+    paddingVertical: 8,
+    borderRadius: 25,
+  },
+  recordingDot: {
+    width: 10,
+    height: 10,
+    borderRadius: 5,
+    backgroundColor: 'white',
+    marginRight: 8,
+  },
+  recordingText: {
+    color: 'white',
+    fontSize: 14,
+    fontWeight: 'bold',
+  },
+  cameraControls: {
+    position: 'absolute',
+    bottom: 0,
+    left: 0,
+    right: 0,
+    paddingHorizontal: 30,
+    paddingBottom: 40,
+    paddingTop: 20,
+    backgroundColor: 'rgba(26, 26, 46, 0.9)',
+  },
+  controlButtons: {
+    flexDirection: 'row',
+    justifyContent: 'center',
+    alignItems: 'center',
+    gap: 25,
+  },
+  controlButton: {
+    paddingVertical: 16,
+    paddingHorizontal: 28,
+    borderRadius: 8,
+    minWidth: 110,
+    alignItems: 'center',
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.3,
+    shadowRadius: 8,
+    elevation: 6,
+  },
+  recordButton: {
+    backgroundColor: '#4a90e2',
+  },
+  stopButton: {
+    backgroundColor: '#7f8c8d',
+  },
+  closeButton: {
+    backgroundColor: '#34495e',
+  },
+  buttonInner: {
+    alignItems: 'center',
+  },
+  buttonLabel: {
+    color: 'white',
+    fontSize: 16,
+    fontWeight: '600',
+    marginTop: 4,
   },
 });

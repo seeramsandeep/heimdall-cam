@@ -298,7 +298,7 @@ async function processQueue() {
   }
 
   isProcessingQueue = true;
-  console.log(`🔄 Processing analysis queue (${analysisQueue.length} items remaining)`);
+  console.log(` Processing analysis queue (${analysisQueue.length} items remaining)`);
 
   while (analysisQueue.length > 0) {
     const { gcsUri, metadata, resolve } = analysisQueue.shift();
@@ -564,7 +564,7 @@ async function uploadTempFilesToGCP() {
 // Start periodic temp file monitoring
 function startTempFileMonitoring() {
   if (GCS_ENABLED) {
-    console.log('🔄 Starting temp file monitoring (every 3 seconds)');
+    console.log(' Starting temp file monitoring (every 3 seconds)');
     
     // Initial upload
     uploadTempFilesToGCP();
@@ -2030,7 +2030,7 @@ async function startServer() {
     console.log(`   📁 Temp Directory: ${TEMP_DIR}`);
     console.log(`   📁 Uploads Directory: ${UPLOADS_DIR}`);
     console.log(`   🔗 Presigned URLs: 48-hour validity`);
-    console.log(`   🔄 Temp Monitoring: ${GCS_ENABLED ? '✅ Active (2s intervals)' : '❌ Disabled'}`);
+    console.log(`    Temp Monitoring: ${GCS_ENABLED ? '✅ Active (2s intervals)' : '❌ Disabled'}`);
     console.log(`📡 WebSocket server ready for real-time communication`);
     console.log(`🎯 Command center: Connect and emit 'join_command_center'`);
     console.log(`👮 Responders: Connect and emit 'join_responder' with ID`);
